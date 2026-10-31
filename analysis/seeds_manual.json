@@ -1,0 +1,6 @@
+[
+  {"start":"0x00030310","observed":true,"note":"Unresolved indirect call measured in run1_stderr.txt"},
+  {"start":"0x0024138F","observed":true,"note":"D3DX callback measured in boot2/boot3; single RET"},
+  {"start":"0x002B16A4","observed":true,"note":"XPP initialization callback measured in boot2/boot3; prologue through RET 4 at 0x002B17A9"},
+  {"start":"0x000A61B0","observed":true,"note":"Match-load callback from 0x000AB776 in boot23_syncinput; verified FLD/FCOMP prologue preceding the discovered interior alias 0x000A61EC"}
+]

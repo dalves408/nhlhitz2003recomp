@@ -1,0 +1,50 @@
+# ── Game data: never commit (bring your own legally owned disc) ──
+*.iso
+*.xiso
+*.xbe
+extracted/
+game_files/
+native/game
+runtime/
+
+# Generated C is derived from the game binary: regenerate with scripts/prepare.py
+native/src/recomp/gen/
+
+# ── Analysis output (logs, captures, dumps that contain guest RAM) ──
+# Everything in analysis/ is local except the seed list prepare.py needs.
+analysis/*
+!analysis/seeds_manual.json
+
+# ── Build output ──
+native/build/
+native/build-*/
+build/
+*.obj
+*.pdb
+*.ilk
+*.exe
+*.dll
+*.lib
+*.dmp
+*.bmp
+*.log
+native/xbox_kernel.log
+
+# ── Local tools and archives not part of the project ──
+tools/renderdoc/
+tools/xiso/
+tools/xiso.zip
+tools/Xbox-XBERecomp/
+_hitzpro_discarded/
+
+# Superseded working note (kept locally only)
+STATUS_AND_HANDOFF_CLAUDE.md
+
+# ── Python / editors / OS ──
+__pycache__/
+*.pyc
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
