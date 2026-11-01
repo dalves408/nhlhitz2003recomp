@@ -4786,6 +4786,29 @@ static void bridge_NtReadFile(void)
         off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
         poff = &off;
     }
+    /* Opt-in evidence before a streaming read reuses guest storage. This
+     * captures the original bytes; a crash dump only contains the overwrite. */
+    {
+        static int capture = -1;
+        static LONG sequence;
+        if (capture < 0) capture = getenv("RECOMP_READ_CAPTURE") != NULL;
+        if (capture && length >= 262144u && length <= (8u << 20)) {
+            char path[MAX_PATH];
+            FILE *f;
+            snprintf(path, sizeof path, "%s_%ld_%08X_%lld.bin",
+                     getenv("RECOMP_READ_CAPTURE"), (long)InterlockedIncrement(&sequence),
+                     buffer_va, (long long)off.QuadPart);
+            f = fopen(path, "wb");
+            if (f) {
+                fwrite(XBOX_TO_NATIVE(buffer_va), 1, length, f);
+                fclose(f);
+                fprintf(stderr, "[READ-CAPTURE] before buf=%08X bytes=%u offset=%lld path=%s\n",
+                        buffer_va, length, (long long)off.QuadPart, path);
+            }
+        }
+    }
+    { extern void hitz_nis_read_trace(uint32_t, uint32_t, int64_t);
+      hitz_nis_read_trace(buffer_va, length, off.QuadPart); }
     g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
                 XBOX_TO_NATIVE(buffer_va), length, poff);
 
@@ -4801,12 +4824,13 @@ static void bridge_NtReadFile(void)
          * early looks identical to one that never started -- until you can
          * see where each one landed. */
         if (poff)
-            fprintf(stderr, "  [READ] from=0x%08X ev=%08X apc=%08X @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+            fprintf(stderr, "  [READ] from=0x%08X ev=%08X apc=%08X @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X buf=%08X handle=%08X\n",
                     g_xbox_kernel_caller, STACK_ARG(1), STACK_ARG(2),
                     (long long)off.QuadPart, length, got,
                     (uint32_t)ios.Status,
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
-                    got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
+                    got > 2 ? p[2] : 0, got > 3 ? p[3] : 0,
+                    buffer_va, STACK_ARG(0));
         else
             fprintf(stderr, "  [READ] from=0x%08X @seq want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
                     g_xbox_kernel_caller,

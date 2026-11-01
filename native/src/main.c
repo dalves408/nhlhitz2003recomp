@@ -426,9 +426,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
          * renderer consumes it. Synchronous submission preserves lifetime. */
         if (!getenv("RECOMP_GFX_THREAD")) _putenv_s("RECOMP_GFX_THREAD", "0");
         _putenv_s("RECOMP_FB_WINDOW", "");
-        if (!getenv("RECOMP_FLIP_PACING")) _putenv_s("RECOMP_FLIP_PACING", "edge");
+        if (!getenv("RECOMP_FLIP_PACING")) _putenv_s("RECOMP_FLIP_PACING", "0");
+        if (!getenv("RECOMP_PRESENT_HZ")) _putenv_s("RECOMP_PRESENT_HZ", "0");
+        if (!getenv("RECOMP_D3D11_VSYNC")) _putenv_s("RECOMP_D3D11_VSYNC", "0");
         if (!getenv("RECOMP_D3D11_RC")) _putenv_s("RECOMP_D3D11_RC", "1");
         if (!getenv("RECOMP_D3D11_GPUVS")) _putenv_s("RECOMP_D3D11_GPUVS", "1");
+        /* FFP math is verified against the CPU reference. Unsupported batches
+         * keep the CPU path; shader compilation can run on a worker while
+         * that same fallback renders, without delaying the frame. */
+        if (!getenv("RECOMP_GPU_FFP")) _putenv_s("RECOMP_GPU_FFP", "1");
+        if (!getenv("RECOMP_D3D11_GPUVS_ASYNC")) _putenv_s("RECOMP_D3D11_GPUVS_ASYNC", "1");
+        /* 2,369 runtime texture comparisons matched the scalar decoder.
+         * Cache compiled bytecode so repeat visits avoid D3DCompile hitches. */
+        if (!getenv("RECOMP_TEXDEC_FAST")) _putenv_s("RECOMP_TEXDEC_FAST", "1");
+        if (!getenv("RECOMP_D3D11_SHADERCACHE")) _putenv_s("RECOMP_D3D11_SHADERCACHE", "1");
+        if (!getenv("RECOMP_SHADER_PREWARM")) _putenv_s("RECOMP_SHADER_PREWARM", "1");
         if (!getenv("RECOMP_D3D11_SHAREZ")) _putenv_s("RECOMP_D3D11_SHAREZ", "1");
         if (!getenv("RECOMP_NV_BLIT")) _putenv_s("RECOMP_NV_BLIT", "1");
         if (!getenv("RECOMP_INLINE_SHORTFIX")) _putenv_s("RECOMP_INLINE_SHORTFIX", "1");

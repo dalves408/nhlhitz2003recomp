@@ -76,6 +76,90 @@ void sub_000A61B0_enter(void)
 extern void sub_0003F680(void);
 static int hitz_load_batch_depth, hitz_load_batch_pending;
 
+static int hitz_nis_trace_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("RECOMP_NIS_TRACE"); on = e && e[0] == '1'; }
+    return on;
+}
+
+
+static uint32_t hitz_trace_u32(uint32_t p)
+{
+    uint32_t v = 0; SIZE_T got;
+    ReadProcessMemory(GetCurrentProcess(), (const void *)((uintptr_t)g_xbox_mem_offset+p), &v, sizeof v, &got);
+    return v;
+}
+
+static void hitz_nis_player_trace(const char *where, uint32_t player)
+{
+    unsigned i;
+    fprintf(stderr, "[NIS-PLAYER] %s player=%08X state=%X flags=%X restore=%u anims",
+            where, player, hitz_trace_u32(player+0x3368), hitz_trace_u32(player+0x33A4),
+            hitz_trace_u32(player+0x188)&255);
+    for (i=0; i<4; ++i) {
+        uint32_t a = hitz_trace_u32(player+0x70+4*i);
+        fprintf(stderr, " %08X:%X/%08X", a, hitz_trace_u32(a)&255, hitz_trace_u32(a+8));
+    }
+    fputc('\n', stderr);
+}
+
+void hitz_nis_read_trace(uint32_t buffer, uint32_t bytes, int64_t offset)
+{
+    unsigned t, i, j;
+    if (!hitz_nis_trace_enabled() || bytes != 503296u) return;
+    fprintf(stderr, "[NIS-REUSE] buffer=%08X bytes=%u offset=%lld active=%08X\n",
+            buffer, bytes, (long long)offset, hitz_trace_u32(0x491F44));
+    for (t=0; t<2; ++t) {
+        uint32_t team = hitz_trace_u32(0x441B20+4*t), roster = hitz_trace_u32(team);
+        if (!team || !roster) continue;
+        for (i=0; i<7; ++i) {
+            uint32_t player = hitz_trace_u32(roster+4*i);
+            if (!player) continue;
+            for (j=0; j<4; ++j) {
+                uint32_t a = hitz_trace_u32(player+0x70+4*j), p = hitz_trace_u32(a+8);
+                if (p >= buffer && (uint64_t)p < (uint64_t)buffer+bytes) {
+                    hitz_nis_player_trace("before read", player);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+extern void sub_0006CEB0(void);
+static void hitz_nis_restore_trace(void)
+{
+    uint32_t player = g_ecx;
+    hitz_nis_player_trace("restore enter", player);
+    sub_0006CEB0();
+    hitz_nis_player_trace("restore exit", player);
+}
+
+/* Observe the NIS double-buffer state machine without changing completion or
+ * reference counts. The animation crash follows reuse of one of its buffers. */
+extern void sub_00146FF0(void);
+static void hitz_nis_pump_trace(void)
+{
+    static uint32_t last[2][5];
+    uint32_t before[2][5];
+    unsigned i, j;
+    for (i = 0; i < 2; ++i) {
+        uint32_t p = *(uint32_t *)((uintptr_t)g_xbox_mem_offset + 0x491F3Cu + 4*i);
+        uint32_t *m = (uint32_t *)((uintptr_t)g_xbox_mem_offset + p);
+        before[i][0] = p; before[i][1] = m[0x34/4]; before[i][2] = m[1];
+        before[i][3] = m[3]; before[i][4] = m[0x24/4];
+        for (j = 0; j < 5; ++j) if (last[i][j] != before[i][j]) break;
+        if (j < 5) {
+            fprintf(stderr, "[NIS] slot=%u obj=%08X state=%u refs=%u/%u filepos=%08X active=%08X\n",
+                    i, p, before[i][1], before[i][2], before[i][3], before[i][4],
+                    *(uint32_t *)((uintptr_t)g_xbox_mem_offset + 0x491F44u));
+            for (j = 0; j < 5; ++j) last[i][j] = before[i][j];
+        }
+    }
+    sub_00146FF0();
+}
+
 /* Hitz 2003's group completion is instruction-equivalent to Pro's 0x28A70:
  * decrement 0x43F3A4 and post event 0x117 when it reaches zero. During the
  * request batch (0x3F680), synchronous reads must not post "all done" after
@@ -202,6 +286,12 @@ static void hitz_wait_trace(void)
  */
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
 {
+    if (xbox_va == 0x0006CEB0u && hitz_nis_trace_enabled()) return hitz_nis_restore_trace;
+    if (xbox_va == 0x00146FF0u) {
+        static int trace = -1;
+        if (trace < 0) { const char *e = getenv("RECOMP_NIS_TRACE"); trace = e && e[0] == '1'; }
+        if (trace) return hitz_nis_pump_trace;
+    }
     if (xbox_va == 0x0003D650u) return hitz_group_done;
     if (xbox_va == 0x0003F680u) return hitz_load_batch;
     if (xbox_va >= 0xFE000000u && g_xbox_mem_offset) {

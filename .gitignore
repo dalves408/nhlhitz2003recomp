@@ -6,6 +6,8 @@ extracted/
 game_files/
 native/game
 runtime/
+/game/
+/NHLHitz03.7z
 
 # Generated C is derived from the game binary: regenerate with scripts/prepare.py
 native/src/recomp/gen/
@@ -28,6 +30,8 @@ build/
 *.dmp
 *.bmp
 *.log
+shadercache/
+*.hsrc
 native/xbox_kernel.log
 
 # ── Local tools and archives not part of the project ──

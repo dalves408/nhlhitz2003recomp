@@ -38,6 +38,8 @@
 #include <string.h>
 #include "nv2a_backend.h"
 #include "nv2a_pbx.h"        /* project: combiner state for batches that have it */
+#include "nv2a_surface_formats.h"
+#include "shader_cache_format.h"
 
 /* Graphics thread (RECOMP_GFX_THREAD, on by default): the executor only records each draw, clear, flip and
  * blit; this back end's own thread replays them. s_async says so; while a recorded draw is replayed the
@@ -45,6 +47,9 @@
 static int s_async;
 static volatile LONG s_dev_ready;     /* the graphics thread has made the window and device */
 static const Nv2aBatchExt *s_wx;
+static uint32_t s_wformat;
+static uint32_t surface_color_format(void)
+{ return s_async ? s_wformat : nv2a_pbx_surface_color_format(); }
 static const Nv2aBatchExt *pbx_cur(void) { return s_async ? s_wx : (nv2a_pbx_current)(); }
 #define nv2a_pbx_current() pbx_cur()
 
@@ -56,6 +61,8 @@ extern void xbox_InputKeysClear(void);
 
 typedef struct {
     uint32_t va, w, h, zeta_va;
+    uint32_t color_format, bytes_per_pixel;
+    DXGI_FORMAT dxgi_format;
     ID3D11Texture2D        *tex;
     ID3D11RenderTargetView *rtv;
     uint32_t uses;               /* clears + draws since the last flip */
@@ -67,6 +74,7 @@ typedef struct {
     uint8_t ms, dirty;               /* drawn with MSAA / drawn to since the last resolve */
 } RenderTarget;
 static void rt_resolve(RenderTarget *r);
+static RenderTarget *s_asp_last;
 
 /* Small cache of D3D11 state objects keyed by a memcmp-able struct. */
 #define MAX_STATES 256
@@ -210,13 +218,14 @@ static int s_msaa = 1;            /* F1 anti-aliasing: 1 (off), 2, 4, 8 samples 
 static int s_msaa_applied = 1;
 static int s_stretch;             /* F1 "Stretch image": fill the window instead of the 4:3 shape */
 static int s_fpsi;                /* F1 "Frame Rate": index into SET_FPS_HZ */
+static int s_present_override = -1;
 static int s_hires = 1;           /* F1 "Hi-res textures" (settings.ini [textures] enabled) */
 static int s_cat_on[5] = { 1, 1, 1, 1, 1 };   /* texture pack folders rink, logos, jerseys, glow, other (config.exe Textures tab) */
 static int s_tex_flush;           /* re-check every cached texture against the pack */
 static unsigned s_pack_hits[5];   /* replacements loaded per kind (log) */
 static void pack_init(void);
 static int pack_installed(void);
-static const unsigned SET_FPS_HZ[6] = { 30, 60, 120, 144, 240, 360 };   /* the last is "uncapped": more only costs CPU (1000 measured slower) */
+static const unsigned SET_FPS_HZ[6] = { 30, 60, 120, 144, 240, 0 };   /* zero disables presentation pacing */
 extern void xbox_set_vblank_hz(unsigned hz);   /* kernel_bridge.c override: the display rate the game sees */
 
 /* The most samples (up to the chosen number) the card supports for both the colour and depth formats. */
@@ -293,11 +302,14 @@ static void settings_load(void)
     s_msaa_applied = s_msaa;
     s_stretch = cfg_get("stretch", 0) != 0;
     {   /* the game's frame rate is the rate of the display it is told it has; saved as that number of hertz */
-        int hz = cfg_get("frame_rate", 60), i, best = 0, bd = 1 << 30;
+        const char *present = getenv("RECOMP_PRESENT_HZ");
+        int hz = present ? atoi(present) : cfg_get("frame_rate", 0), i, best = 0, bd = 1 << 30;
+        s_present_override = present ? (atoi(present) > 0 ? atoi(present) : 0) : -1;
+        if (hz >= 360) hz = 0; /* legacy "uncapped up to 360" setting */
         for (i = 0; i < 6; i++)
             if (abs((int)SET_FPS_HZ[i] - hz) < bd) { bd = abs((int)SET_FPS_HZ[i] - hz); best = i; }
         s_fpsi = best;
-        if (SET_FPS_HZ[best] != 60) xbox_set_vblank_hz(SET_FPS_HZ[best]);
+        if (SET_FPS_HZ[best] && SET_FPS_HZ[best] != 60) xbox_set_vblank_hz(SET_FPS_HZ[best]);
     }
     a = cfg_get("anisotropy", 1);
     s_aniso = a >= 16 ? 16 : a >= 8 ? 8 : a >= 4 ? 4 : a >= 2 ? 2 : 1;
@@ -320,7 +332,7 @@ static const char *const SET_RES[5] = {
 static const char *const SET_OFFON[2] = { "Off", "On" };
 static const char *const SET_ANISO[5] = { "Off", "2x", "4x", "8x", "16x" };
 static const char *const SET_STRETCH[2] = { "Off (4:3)", "On (fills window)" };
-static const char *const SET_FPS[6] = { "30", "60 (original)", "120", "144", "240", "Uncapped (up to 360)" };
+static const char *const SET_FPS[6] = { "30", "60 (original)", "120", "144", "240", "Uncapped" };
 static const char *const SET_AA[4] = { "Off", "2x MSAA", "4x MSAA", "8x MSAA" };
 
 /* Hi-res textures cannot be used without a pack, or at Render Scale 1x (native): that row is dark and skipped */
@@ -385,7 +397,7 @@ static void set_put(int i, int v)
         if (!s_stretch && !s_fs) aspect_on_size();      /* back to the 4:3 window shape */
         break;
     case IT_VSYNC: g.vsync = v; cfg_put("vsync", v); break;
-    case IT_FPS: s_fpsi = v; cfg_put("frame_rate", (int)SET_FPS_HZ[v]); xbox_set_vblank_hz(SET_FPS_HZ[v]); break;
+    case IT_FPS: s_fpsi = v; s_present_override = -1; cfg_put("frame_rate", (int)SET_FPS_HZ[v]); xbox_set_vblank_hz(SET_FPS_HZ[v] ? SET_FPS_HZ[v] : 60); break;
     case IT_AA: s_msaa = v ? 1 << v : 1; cfg_put("msaa", s_msaa); break;       /* applied by the next draw */
     case IT_ANISO: s_aniso = v ? 1 << v : 1; cfg_put("anisotropy", s_aniso); break;
     case IT_HIRES: s_hires = v; cfg_put_s("textures", "enabled", v); s_tex_flush = 1; break;   /* cached textures are re-made */
@@ -835,6 +847,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 }
 
 static int init_pipeline(void);
+static void shader_prewarm(void);
 
 static int init_window_and_device(void)
 {
@@ -883,6 +896,7 @@ static int init_window_and_device(void)
         return 0;
     }
     logf_("device up, feature level 0x%X\n", (unsigned)fl);
+    shader_prewarm();
     if (!init_pipeline()) { g.failed = 1; return 0; }
     return 1;
 }
@@ -955,21 +969,32 @@ static int ensure_swap(uint32_t w, uint32_t h)
     return 1;
 }
 
-static RenderTarget *get_rt(const Nv2aSurface *s)
+static RenderTarget *get_rt(const Nv2aSurface *s, uint32_t color_format)
 {
     RenderTarget *r;
     int i;
     D3D11_TEXTURE2D_DESC td;
     HRESULT hr;
+    DXGI_FORMAT format = hitz_rt_dxgi_format(color_format);
 
-    if (s->bytes_per_pixel != 4) return NULL;      /* 16-bit surfaces: not handled yet */
+    if (format == DXGI_FORMAT_UNKNOWN) {
+        static unsigned warned;
+        if (warned++ < 8) logf_("unsupported surface color format %X va=%08X bpp=%u\n", color_format,s->color_va,s->bytes_per_pixel);
+        return NULL;
+    }
     for (i = 0; i < g.nrt; i++)
-        if (g.rt[i].va == s->color_va && g.rt[i].w == s->width && g.rt[i].h == s->height)
+        if (g.rt[i].va == s->color_va && g.rt[i].w == s->width && g.rt[i].h == s->height && g.rt[i].color_format == color_format)
             return &g.rt[i];
-    if (g.nrt >= MAX_RT) {
+    /* A guest allocation can be reused with another storage format. Remove
+     * its previous view so render-to-texture lookup cannot sample stale data. */
+    for (i = 0; i < g.nrt; i++)
+        if (g.rt[i].va == s->color_va && g.rt[i].w == s->width && g.rt[i].h == s->height) break;
+    if (i < g.nrt || g.nrt >= MAX_RT) {
         /* Drop the least used entry. */
-        int worst = 0;
-        for (i = 1; i < g.nrt; i++) if (g.rt[i].uses < g.rt[worst].uses) worst = i;
+        int worst = i < g.nrt ? i : 0;
+        if (i == g.nrt)
+            for (i = 1; i < g.nrt; i++) if (g.rt[i].uses < g.rt[worst].uses) worst = i;
+        s_asp_last = NULL;
         ID3D11RenderTargetView_Release(g.rt[worst].rtv);
         if (g.rt[worst].mrtv) ID3D11RenderTargetView_Release(g.rt[worst].mrtv);
         if (g.rt[worst].mtex) ID3D11Texture2D_Release(g.rt[worst].mtex);
@@ -986,7 +1011,7 @@ static RenderTarget *get_rt(const Nv2aSurface *s)
     td.Height = s->height * (UINT)s_scale;
     td.MipLevels = 1;
     td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.Format = format;
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
@@ -1011,9 +1036,18 @@ static RenderTarget *get_rt(const Nv2aSurface *s)
         return NULL;
     }
     r->va = s->color_va;
+    r->color_format = color_format; r->bytes_per_pixel = s->bytes_per_pixel; r->dxgi_format = format;
     r->w = s->width;
     r->h = s->height;
     g.nrt++;
+    if (color_format == 1 || color_format == 2) {
+        /* These are X1 formats: the padding bit is fixed, not shader alpha. */
+        float c[4] = {0,0,0,color_format == 2 ? 1.0f : 0.0f};
+        ID3D11DeviceContext_ClearRenderTargetView(g.ctx, r->rtv, c);
+        if (r->mrtv) ID3D11DeviceContext_ClearRenderTargetView(g.ctx, r->mrtv, c);
+    }
+    if (s->bytes_per_pixel == 2)
+        logf_("16-bit render surface va=%08X %ux%u NVfmt=%X DXGIfmt=%u\n", r->va,r->w,r->h,color_format,format);
     if (g.log)
         logf_("new render surface #%d va=0x%08X %ux%u pitch=%u aa=%ux%u\n", g.nrt,
               s->color_va, s->width, s->height, s->pitch, s->aa_sx, s->aa_sy);
@@ -1079,26 +1113,26 @@ static double   s_cmp_ms, s_cmp_vs_ms;
  * RECOMP_D3D11_SHADERCACHE_DIR). A file is: magic, format, two independent 64-bit hashes of
  * the key text, source length, blob size, blob checksum, blob. Anything that does not match
  * exactly is ignored and recompiled; files are written to a temp name and renamed. */
-#define SC_MAGIC  0x31434853u            /* "SHC1" */
-#define SC_FORMAT 3u                     /* bump when the file layout or compile flags change */
-typedef struct { uint32_t magic, format; uint64_t h1, h2; uint32_t srclen, size; uint64_t sum; } ScHdr;
-
 static uint32_t s_sc_hit, s_sc_miss, s_sc_store;
-static double   s_sc_ms;
-
-static uint64_t sc_hash(const void *p, size_t n, uint64_t h)
-{
-    const unsigned char *s = (const unsigned char *)p;
-    size_t i;
-    for (i = 0; i < n; i++) { h ^= s[i]; h *= 1099511628211ull; }
-    return h;
-}
+static double s_sc_ms;
+static volatile LONG s_sc_compiles, s_warm_blob_hits, s_warm_object_hits;
+#define SHADER_WARM_MAX 512
+static struct {
+    uint64_t h1, h2;
+    uint32_t srclen;
+    ID3DBlob *blob;
+    ID3D11VertexShader *vs;
+    ID3D11PixelShader *ps;
+} s_warm[SHADER_WARM_MAX];
+static uint32_t s_nwarm;
 
 static int sc_enabled(void)
 {
     static int on = -1;
-    if (on < 0)
-        on = getenv("RECOMP_D3D11_SHADERCACHE") != NULL;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_D3D11_SHADERCACHE");
+        on = e && e[0] == '1';
+    }
     return on;
 }
 
@@ -1126,58 +1160,88 @@ static const char *sc_dir(void)
 static void sc_key(const char *src, size_t len, const char *entry, const char *target,
                    uint64_t *h1, uint64_t *h2, char *path, size_t pathcap)
 {
-    char tag[96];
-    int tl = snprintf(tag, sizeof tag, "|%s|%s|opt3|d3dcompiler%d|f%u", entry, target,
-                      (int)D3D_COMPILER_VERSION, SC_FORMAT);
-    *h1 = sc_hash(tag, (size_t)tl, sc_hash(src, len, 14695981039346656037ull));
-    *h2 = sc_hash(src, len, sc_hash(tag, (size_t)tl, 0x9E3779B97F4A7C15ull));
+    sc_hash_key(src, len, entry, target, h1, h2);
     snprintf(path, pathcap, "%s\\%s_%016llx.bin", sc_dir(), target, (unsigned long long)*h1);
-}
-
-static ID3DBlob *sc_load(const char *path, uint64_t h1, uint64_t h2, size_t srclen)
-{
-    FILE *f = fopen(path, "rb");
-    ScHdr h;
-    ID3DBlob *blob = NULL;
-
-    if (!f) return NULL;
-    if (fread(&h, sizeof h, 1, f) == 1 && h.magic == SC_MAGIC && h.format == SC_FORMAT
-        && h.h1 == h1 && h.h2 == h2 && h.srclen == (uint32_t)srclen && h.size && h.size < (64u << 20)
-        && SUCCEEDED(D3DCreateBlob(h.size, &blob))) {
-        void *p = ID3D10Blob_GetBufferPointer(blob);
-        if (fread(p, 1, h.size, f) != h.size || sc_hash(p, h.size, 14695981039346656037ull) != h.sum) {
-            ID3D10Blob_Release(blob);
-            blob = NULL;
-        }
-    }
-    fclose(f);
-    return blob;
 }
 
 static void sc_store(const char *path, uint64_t h1, uint64_t h2, size_t srclen, ID3DBlob *blob)
 {
-    static volatile LONG seq;
-    char tmp[MAX_PATH + 32];
-    ScHdr h;
-    FILE *f;
-    size_t n = ID3D10Blob_GetBufferSize(blob);
-    const void *p = ID3D10Blob_GetBufferPointer(blob);
+    if (sc_write(path,h1,h2,srclen,blob)) InterlockedIncrement((volatile LONG *)&s_sc_store);
+}
 
-    snprintf(tmp, sizeof tmp, "%s.%lu.%ld.tmp", path, GetCurrentThreadId(), (long)InterlockedIncrement(&seq));
-    f = fopen(tmp, "wb");
-    if (!f) return;
-    h.magic = SC_MAGIC; h.format = SC_FORMAT; h.h1 = h1; h.h2 = h2;
-    h.srclen = (uint32_t)srclen; h.size = (uint32_t)n;
-    h.sum = sc_hash(p, n, 14695981039346656037ull);
-    if (fwrite(&h, sizeof h, 1, f) == 1 && fwrite(p, 1, n, f) == n && fclose(f) == 0) {
-        if (MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING))
-            InterlockedIncrement((volatile LONG *)&s_sc_store);
-        else
-            DeleteFileA(tmp);
-    } else {
-        fclose(f);
-        DeleteFileA(tmp);
+/* Capture complete, owned HLSL input for the offline preparer. Opt-in: these
+ * derived sources stay in the caller's local cache/analysis directory. */
+static void shader_capture(const char *src,size_t len,const char *entry,const char *target)
+{
+    const char *dir=getenv("RECOMP_SHADER_CAPTURE_DIR");
+    uint64_t h1,h2;char path[MAX_PATH+96],tmp[MAX_PATH+128];ScSourceHdr h;FILE *f;int ok,closed;
+    if(!dir || !*dir || len>(4u<<20))return;
+    sc_hash_key(src,len,entry,target,&h1,&h2);
+    CreateDirectoryA(dir,NULL);
+    snprintf(path,sizeof path,"%s\\%s_%016llx.hsrc",dir,target,(unsigned long long)h1);
+    if(GetFileAttributesA(path)!=INVALID_FILE_ATTRIBUTES)return;
+    snprintf(tmp,sizeof tmp,"%s.%lu.tmp",path,GetCurrentThreadId());
+    memset(&h,0,sizeof h);h.magic=SC_SOURCE_MAGIC;h.format=1;h.srclen=(uint32_t)len;
+    snprintf(h.entry,sizeof h.entry,"%s",entry);snprintf(h.target,sizeof h.target,"%s",target);
+    f=fopen(tmp,"wb");if(!f)return;
+    ok=fwrite(&h,sizeof h,1,f)==1 && fwrite(src,1,len,f)==len;closed=fclose(f)==0;
+    if(!ok || !closed || !MoveFileExA(tmp,path,MOVEFILE_REPLACE_EXISTING))DeleteFileA(tmp);
+}
+
+/* Runs before the first game frame, and before shader workers are started.
+ * The cache is then immutable: workers can safely AddRef prepared objects. */
+static void shader_prewarm(void)
+{
+    const char *on=getenv("RECOMP_SHADER_PREWARM");
+    char pattern[MAX_PATH+32],path[MAX_PATH+96];WIN32_FIND_DATAA fd;HANDLE find;
+    uint64_t bytes=0;uint32_t rejected=0,vsn=0,psn=0;ULONGLONG began=GetTickCount64();
+    if(!sc_enabled() || !on || on[0]!='1')return;
+    snprintf(pattern,sizeof pattern,"%s\\*.bin",sc_dir());find=FindFirstFileA(pattern,&fd);
+    if(find!=INVALID_HANDLE_VALUE) {
+        do {
+            ScHdr h;FILE *f;ID3DBlob *blob;ID3D11VertexShader *vs=NULL;ID3D11PixelShader *ps=NULL;
+            HRESULT hr;int vertex=!strncmp(fd.cFileName,"vs_",3),pixel=!strncmp(fd.cFileName,"ps_",3);
+            if((fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY) || (!vertex && !pixel))continue;
+            if(s_nwarm>=SHADER_WARM_MAX)break;
+            snprintf(path,sizeof path,"%s\\%s",sc_dir(),fd.cFileName);f=fopen(path,"rb");if(!f)continue;
+            memset(&h,0,sizeof h);hr=fread(&h,sizeof h,1,f)==1?S_OK:E_FAIL;fclose(f);
+            if(FAILED(hr) || h.magic!=SC_MAGIC || h.format!=SC_FORMAT || !h.size || h.size>=(64u<<20)) {rejected++;continue;}
+            if(bytes+h.size>(64u<<20))break;
+            blob=sc_load(path,h.h1,h.h2,h.srclen);if(!blob){rejected++;continue;}
+            if(vertex)hr=ID3D11Device_CreateVertexShader(g.dev,ID3D10Blob_GetBufferPointer(blob),ID3D10Blob_GetBufferSize(blob),NULL,&vs);
+            else hr=ID3D11Device_CreatePixelShader(g.dev,ID3D10Blob_GetBufferPointer(blob),ID3D10Blob_GetBufferSize(blob),NULL,&ps);
+            if(FAILED(hr)){ID3D10Blob_Release(blob);rejected++;continue;}
+            s_warm[s_nwarm].h1=h.h1;s_warm[s_nwarm].h2=h.h2;s_warm[s_nwarm].srclen=h.srclen;
+            s_warm[s_nwarm].blob=blob;s_warm[s_nwarm].vs=vs;s_warm[s_nwarm].ps=ps;s_nwarm++;
+            bytes+=h.size;vsn+=vertex;psn+=pixel;
+        }while(FindNextFileA(find,&fd));FindClose(find);
     }
+    logf_("SHADER-PREWARM ready=%u vertex=%u pixel=%u rejected=%u bytes=%llu startup_ms=%llu\n",
+          s_nwarm,vsn,psn,rejected,(unsigned long long)bytes,(unsigned long long)(GetTickCount64()-began));
+}
+static ID3DBlob *shader_warm_blob(uint64_t h1,uint64_t h2,size_t len)
+{
+    uint32_t i;
+    for(i=0;i<s_nwarm;i++)if(s_warm[i].h1==h1 && s_warm[i].h2==h2 && s_warm[i].srclen==len) {
+        ID3D10Blob_AddRef(s_warm[i].blob);InterlockedIncrement(&s_warm_blob_hits);return s_warm[i].blob;
+    }
+    return NULL;
+}
+static HRESULT shader_create_vs(ID3DBlob *blob,ID3D11VertexShader **out)
+{
+    uint32_t i;
+    for(i=0;i<s_nwarm;i++)if(s_warm[i].blob==blob && s_warm[i].vs) {
+        ID3D11VertexShader_AddRef(s_warm[i].vs);*out=s_warm[i].vs;InterlockedIncrement(&s_warm_object_hits);return S_OK;
+    }
+    return ID3D11Device_CreateVertexShader(g.dev,ID3D10Blob_GetBufferPointer(blob),ID3D10Blob_GetBufferSize(blob),NULL,out);
+}
+static HRESULT shader_create_ps(ID3DBlob *blob,ID3D11PixelShader **out)
+{
+    uint32_t i;
+    for(i=0;i<s_nwarm;i++)if(s_warm[i].blob==blob && s_warm[i].ps) {
+        ID3D11PixelShader_AddRef(s_warm[i].ps);*out=s_warm[i].ps;InterlockedIncrement(&s_warm_object_hits);return S_OK;
+    }
+    return ID3D11Device_CreatePixelShader(g.dev,ID3D10Blob_GetBufferPointer(blob),ID3D10Blob_GetBufferSize(blob),NULL,out);
 }
 
 static ID3DBlob *compile_hlsl_src(const char *src, size_t len, const char *entry, const char *target)
@@ -1190,11 +1254,13 @@ static ID3DBlob *compile_hlsl_src(const char *src, size_t len, const char *entry
     double ms;
     int use_cache = sc_enabled();
 
+    shader_capture(src,len,entry,target);
     QueryPerformanceCounter(&q0);
     QueryPerformanceFrequency(&qf);
     if (use_cache) {
         sc_key(src, len, entry, target, &k1, &k2, cpath, sizeof cpath);
-        code = sc_load(cpath, k1, k2, len);
+        code = shader_warm_blob(k1,k2,len);
+        if (!code) code = sc_load(cpath, k1, k2, len);
         if (code) {
             QueryPerformanceCounter(&q1);
             ms = 1000.0 * (double)(q1.QuadPart - q0.QuadPart) / (double)qf.QuadPart;
@@ -1207,6 +1273,7 @@ static ID3DBlob *compile_hlsl_src(const char *src, size_t len, const char *entry
         }
         InterlockedIncrement((volatile LONG *)&s_sc_miss);
     }
+    InterlockedIncrement(&s_sc_compiles);
     hr = D3DCompile(src, len, "d3d11_backend.hlsl", NULL, NULL,
                     entry, target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err);
     QueryPerformanceCounter(&q1);
@@ -1289,8 +1356,7 @@ static ID3D11PixelShader *rc_get_ps(const RcConsts *c)
     blob = compile_hlsl_src(src, len, "ps_rc", "ps_4_0");
     free(src);
     if (blob) {
-        if (FAILED(ID3D11Device_CreatePixelShader(g.dev, ID3D10Blob_GetBufferPointer(blob),
-                                                  ID3D10Blob_GetBufferSize(blob), NULL, &ps)))
+        if (FAILED(shader_create_ps(blob, &ps)))
             ps = NULL;
         ID3D10Blob_Release(blob);
     }
@@ -1328,11 +1394,9 @@ static void init_rc_pipeline(void)
     vsb = compile_hlsl_src(k_hlsl_rc, sizeof k_hlsl_rc - 1, "vs_rc", "vs_4_0");
     psb = compile_hlsl_src(k_hlsl_rc, sizeof k_hlsl_rc - 1, "ps_rc", "ps_4_0");
     if (!vsb || !psb) { logf_("combiner shaders did not compile: path off\n"); return; }
-    hr = ID3D11Device_CreateVertexShader(g.dev, ID3D10Blob_GetBufferPointer(vsb),
-                                         ID3D10Blob_GetBufferSize(vsb), NULL, &g.vs_rc);
+    hr = shader_create_vs(vsb, &g.vs_rc);
     if (SUCCEEDED(hr))
-        hr = ID3D11Device_CreatePixelShader(g.dev, ID3D10Blob_GetBufferPointer(psb),
-                                            ID3D10Blob_GetBufferSize(psb), NULL, &g.ps_rc);
+        hr = shader_create_ps(psb, &g.ps_rc);
     if (SUCCEEDED(hr))
         hr = ID3D11Device_CreateInputLayout(g.dev, el, 10, ID3D10Blob_GetBufferPointer(vsb),
                                             ID3D10Blob_GetBufferSize(vsb), &g.layout_rc);
@@ -1380,11 +1444,9 @@ static int init_pipeline(void)
     vsb = compile_hlsl("vs_main", "vs_4_0");
     psb = compile_hlsl("ps_main", "ps_4_0");
     if (!vsb || !psb) return 0;
-    hr = ID3D11Device_CreateVertexShader(g.dev, ID3D10Blob_GetBufferPointer(vsb),
-                                         ID3D10Blob_GetBufferSize(vsb), NULL, &g.vs);
+    hr = shader_create_vs(vsb, &g.vs);
     if (SUCCEEDED(hr))
-        hr = ID3D11Device_CreatePixelShader(g.dev, ID3D10Blob_GetBufferPointer(psb),
-                                            ID3D10Blob_GetBufferSize(psb), NULL, &g.ps);
+        hr = shader_create_ps(psb, &g.ps);
     if (SUCCEEDED(hr))
         hr = ID3D11Device_CreateInputLayout(g.dev, el, 4, ID3D10Blob_GetBufferPointer(vsb),
                                             ID3D10Blob_GetBufferSize(vsb), &g.layout);
@@ -1486,7 +1548,7 @@ static D3D11_COMPARISON_FUNC cmp_func(uint32_t gl)
     return (D3D11_COMPARISON_FUNC)((gl & 7u) + 1u);     /* GL_NEVER..GL_ALWAYS = 0x200..0x207 */
 }
 
-static ID3D11BlendState *get_blend(const Nv2aRenderState *rs)
+static ID3D11BlendState *get_blend(const Nv2aRenderState *rs, uint32_t color_format)
 {
     uint32_t key[5] = { 0 };
     ID3D11BlendState *o;
@@ -1497,6 +1559,7 @@ static ID3D11BlendState *get_blend(const Nv2aRenderState *rs)
     if (rs->color_mask & 0x00000100u) mask |= D3D11_COLOR_WRITE_ENABLE_GREEN;
     if (rs->color_mask & 0x00000001u) mask |= D3D11_COLOR_WRITE_ENABLE_BLUE;
     if (rs->color_mask & 0x01000000u) mask |= D3D11_COLOR_WRITE_ENABLE_ALPHA;
+    if (color_format == 1 || color_format == 2) mask &= ~D3D11_COLOR_WRITE_ENABLE_ALPHA;
     key[0] = rs->blend_enable ? 1 : 0;
     if (key[0]) { key[1] = rs->blend_src; key[2] = rs->blend_dst; key[3] = rs->blend_eq; }
     key[4] = mask;
@@ -2187,7 +2250,7 @@ static void rt_resolve(RenderTarget *r)
 {
     if (r && r->ms && r->dirty) {
         ID3D11DeviceContext_ResolveSubresource(g.ctx, (ID3D11Resource *)r->tex, 0,
-                                               (ID3D11Resource *)r->mtex, 0, DXGI_FORMAT_B8G8R8A8_UNORM);
+                                               (ID3D11Resource *)r->mtex, 0, r->dxgi_format);
         r->dirty = 0;
     }
 }
@@ -2324,9 +2387,9 @@ static ID3D11ShaderResourceView *zeta_as_texture(const Nv2aTexture *t)
         b1 = compile_hlsl_src(zsrc, zlen, "ps_z_abgr", tp);
         b2 = compile_hlsl_src(zsrc, zlen, "ps_z_argb", tp);
         if (b0 && b1 && b2 &&
-            SUCCEEDED(ID3D11Device_CreateVertexShader(g.dev, ID3D10Blob_GetBufferPointer(b0), ID3D10Blob_GetBufferSize(b0), NULL, &vs)) &&
-            SUCCEEDED(ID3D11Device_CreatePixelShader(g.dev, ID3D10Blob_GetBufferPointer(b1), ID3D10Blob_GetBufferSize(b1), NULL, &ps[0])) &&
-            SUCCEEDED(ID3D11Device_CreatePixelShader(g.dev, ID3D10Blob_GetBufferPointer(b2), ID3D10Blob_GetBufferSize(b2), NULL, &ps[1]))) {
+            SUCCEEDED(shader_create_vs(b0, &vs)) &&
+            SUCCEEDED(shader_create_ps(b1, &ps[0])) &&
+            SUCCEEDED(shader_create_ps(b2, &ps[1]))) {
         } else {
             init_failed = 1;
             logf_("ZTEX: shader setup failed\n");
@@ -2477,7 +2540,7 @@ static void be_clear(const Nv2aSurface *s, const Nv2aRenderState *rs,
     if (!init_window_and_device()) return;
     if (s_scale_applied != s_scale || s_msaa_applied != s_msaa) rt_reset_all();
     tex_flush_if_changed();
-    r = get_rt(s);
+    r = get_rt(s, surface_color_format());
     if (!r) return;
     r->uses++;
     if (g.log && (flags & 0xF0u) && argb != g.last_clear) {
@@ -2490,6 +2553,7 @@ static void be_clear(const Nv2aSurface *s, const Nv2aRenderState *rs,
         c[1] = ((argb >> 8) & 0xFF) / 255.0f;
         c[2] = (argb & 0xFF) / 255.0f;
         c[3] = ((argb >> 24) & 0xFF) / 255.0f;
+        if (r->color_format == 1 || r->color_format == 2) c[3] = r->color_format == 2 ? 1.0f : 0.0f;
         ID3D11DeviceContext_ClearRenderTargetView(g.ctx, r->ms ? r->mrtv : r->rtv, c);
         r->dirty = 1;
     }
@@ -2649,7 +2713,7 @@ static void be_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
     }
     if (s_scale_applied != s_scale || s_msaa_applied != s_msaa) rt_reset_all();
     tex_flush_if_changed();
-    r = get_rt(s);
+    r = get_rt(s, surface_color_format());
     if (!r) return;
     r->uses++;
     ensure_depth(r, rs);
@@ -2797,7 +2861,7 @@ static void be_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
             if (strstr(nz, hx)) usez = 0;
         }
         ID3D11DeviceContext_OMSetRenderTargets(g.ctx, 1, &rtv, usez ? r->dsv : NULL);
-        ID3D11DeviceContext_OMSetBlendState(g.ctx, get_blend(rs), bf, 0xFFFFFFFFu);
+        ID3D11DeviceContext_OMSetBlendState(g.ctx, get_blend(rs, r->color_format), bf, 0xFFFFFFFFu);
         ID3D11DeviceContext_OMSetDepthStencilState(g.ctx, get_depth(rs, usez), rs->stencil_ref & 0xFF);
     }
     ID3D11DeviceContext_RSSetState(g.ctx, get_raster(rs, gpu));
@@ -2919,15 +2983,21 @@ static void dump_tex(ID3D11Texture2D *srct, const char *name, int alpha_only)
         for (y = td.Height; y-- > 0; ) {
             const uint8_t *p = (const uint8_t *)m.pData + (size_t)y * m.RowPitch;
             memset(row, 0, rowbytes);
-            for (x = 0; x < td.Width; x++) {          /* source B,G,R,A -> BMP B,G,R */
-                if (alpha_only) row[x * 3 + 0] = row[x * 3 + 1] = row[x * 3 + 2] = p[x * 4 + 3];
-                else {
-                row[x * 3 + 0] = p[x * 4 + 0];
-                row[x * 3 + 1] = p[x * 4 + 1];
-                row[x * 3 + 2] = p[x * 4 + 2];
+            for (x = 0; x < td.Width; x++) {          /* source format -> BMP B,G,R */
+                uint32_t bgra;
+                const uint8_t *pixel = p + x*4;
+                if (td.Format == DXGI_FORMAT_B5G6R5_UNORM || td.Format == DXGI_FORMAT_B5G5R5A1_UNORM) {
+                    bgra = hitz_rt_bgra16(((const uint16_t *)p)[x], td.Format);
+                    pixel = (const uint8_t *)&bgra;
                 }
-                sum[0] += p[x * 4 + 2]; sum[1] += p[x * 4 + 1]; sum[2] += p[x * 4 + 0];
-                if (p[x * 4] | p[x * 4 + 1] | p[x * 4 + 2]) nonblack++;
+                if (alpha_only) row[x * 3 + 0] = row[x * 3 + 1] = row[x * 3 + 2] = pixel[3];
+                else {
+                row[x * 3 + 0] = pixel[0];
+                row[x * 3 + 1] = pixel[1];
+                row[x * 3 + 2] = pixel[2];
+                }
+                sum[0] += pixel[2]; sum[1] += pixel[1]; sum[2] += pixel[0];
+                if (pixel[0] | pixel[1] | pixel[2]) nonblack++;
             }
             fwrite(row, 1, rowbytes, f);
         }
@@ -3493,8 +3563,8 @@ static int aspect_init(void)
     d.AddressU = d.AddressV = d.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     d.MaxLOD = D3D11_FLOAT32_MAX;
     if (b0 && b1 &&
-        SUCCEEDED(ID3D11Device_CreateVertexShader(g.dev, ID3D10Blob_GetBufferPointer(b0), ID3D10Blob_GetBufferSize(b0), NULL, &s_asp_vs)) &&
-        SUCCEEDED(ID3D11Device_CreatePixelShader(g.dev, ID3D10Blob_GetBufferPointer(b1), ID3D10Blob_GetBufferSize(b1), NULL, &s_asp_ps)) &&
+        SUCCEEDED(shader_create_vs(b0, &s_asp_vs)) &&
+        SUCCEEDED(shader_create_ps(b1, &s_asp_ps)) &&
         SUCCEEDED(ID3D11Device_CreateSamplerState(g.dev, &d, &s_asp_smp))) {
         D3D11_BUFFER_DESC bd;
         memset(&bd, 0, sizeof bd);
@@ -3599,8 +3669,7 @@ static void pace_present(void)
     static LONGLONG deadline;
     static unsigned previous_hz;
     LARGE_INTEGER now;
-    const char *setting = getenv("RECOMP_PRESENT_HZ");
-    unsigned hz = setting ? (unsigned)atoi(setting) : SET_FPS_HZ[s_fpsi];
+    unsigned hz = s_present_override >= 0 ? (unsigned)s_present_override : SET_FPS_HZ[s_fpsi];
     LONGLONG period;
     if (!hz) return;
     if (hz > 1000) hz = 1000;
@@ -3630,7 +3699,7 @@ static void be_flip(void)
     pace_present();
     for (i = 0; i < g.nrt; i++) {
         RenderTarget *r = &g.rt[i];
-        if (!r->uses) continue;
+        if (!r->uses || r->bytes_per_pixel != 4) continue; /* this title's display buffers are BGRA8 */
         if (!best || (uint64_t)r->w * r->h > (uint64_t)best->w * best->h
             || ((uint64_t)r->w * r->h == (uint64_t)best->w * best->h && r->uses > best->uses))
             best = r;
@@ -3761,6 +3830,11 @@ static void be_flip(void)
                      (g.flips - f_last) / secs, cpu_pct, gb,
                      (g.flips - f_last) ? (double)(g.draws - d_last) / (g.flips - f_last) : 0.0);
             SetWindowTextA(g.hwnd, tb);
+            if (getenv("RECOMP_PERF_LOG"))
+                fprintf(stderr, "[PERF] t_ms=%llu fps=%.3f process_cpu_pct=%d gpu_pct=%ld present_hz=%u vsync=%d shader_compiles=%ld warm_blobs=%ld warm_objects=%ld\n",
+                        (unsigned long long)now, (g.flips-f_last)/secs, cpu_pct, (long)gp,
+                        s_present_override >= 0 ? (unsigned)s_present_override : SET_FPS_HZ[s_fpsi], g.vsync,
+                        (long)s_sc_compiles,(long)s_warm_blob_hits,(long)s_warm_object_hits);
             if (g.log) logf_("title: %s\n", tb);
             t_last = now; f_last = g.flips; d_last = g.draws;
         }
@@ -3830,11 +3904,11 @@ static const Nv2aBackend s_backend = { be_clear, be_draw, be_flip };
 enum { Q_PAD, Q_CLEAR, Q_DRAW, Q_FLIP, Q_BLIT };
 #define Q_BYTES (24u << 20)
 typedef struct { uint32_t type, size; } QHdr;
-typedef struct { QHdr h; Nv2aSurface s; Nv2aRenderState rs; uint32_t flags, argb, zst; } QClear;
+typedef struct { QHdr h; Nv2aSurface s; Nv2aRenderState rs; uint32_t flags, argb, zst, format; } QClear;
 typedef struct { QHdr h; uint32_t a, b, c, d; } QBlit;
 typedef struct {
     QHdr h; Nv2aSurface s; Nv2aRenderState rs; Nv2aTexture tex; Nv2aBatchExt x; Nv2aCombiner rc; Nv2aGpuVs gv;
-    uint32_t count, has_tex, has_x, has_rc, has_gv, nverts, next, block_bytes;
+    uint32_t count, has_tex, has_x, has_rc, has_gv, nverts, next, block_bytes, format;
 } QDraw;
 
 static uint8_t *q_buf;
@@ -3889,6 +3963,7 @@ static void ab_clear(const Nv2aSurface *s, const Nv2aRenderState *rs, uint32_t f
     QClear *r = (QClear *)q_reserve(q_al(sizeof *r));
     r->h.type = Q_CLEAR; r->h.size = (uint32_t)q_al(sizeof *r);
     r->s = *s; r->rs = *rs; r->flags = flags; r->argb = argb; r->zst = zst;
+    r->format = nv2a_pbx_surface_color_format();
     q_commit(r->h.size, 0);
 }
 
@@ -3912,6 +3987,7 @@ static void ab_draw(const Nv2aSurface *s, const Nv2aBatch *b)
     p = (uint8_t *)r + q_al(sizeof *r);
     r->h.type = Q_DRAW; r->h.size = (uint32_t)total;
     r->s = *s; r->rs = *b->state; r->count = b->count;
+    r->format = nv2a_pbx_surface_color_format();
     r->has_tex = b->texture != NULL;
     if (r->has_tex) r->tex = *b->texture;
     r->has_x = x != NULL; r->has_rc = 0; r->has_gv = gpu; r->nverts = (uint32_t)(vb != 0); r->next = (uint32_t)(eb != 0);
@@ -3957,6 +4033,7 @@ static void q_replay_draw(QDraw *r)
 {
     Nv2aBatch b;
     uint8_t *p = (uint8_t *)r + q_al(sizeof *r);
+    s_wformat = r->format;
 
     memset(&b, 0, sizeof b);
     b.count = r->count; b.state = &r->rs; b.texture = r->has_tex ? &r->tex : NULL;
@@ -3993,7 +4070,7 @@ static DWORD WINAPI gfx_thread_main(LPVOID unused)
         spin = 0;
         h = (QHdr *)(q_buf + (size_t)(tail % Q_BYTES));
         switch (h->type) {
-        case Q_CLEAR: { QClear *c = (QClear *)h; be_clear(&c->s, &c->rs, c->flags, c->argb, c->zst); } break;
+        case Q_CLEAR: { QClear *c = (QClear *)h; s_wformat=c->format; be_clear(&c->s, &c->rs, c->flags, c->argb, c->zst); } break;
         case Q_DRAW:  q_replay_draw((QDraw *)h); break;
         case Q_BLIT:  { QBlit *c = (QBlit *)h; be_blit(c->a, c->b, c->c, c->d); } break;
         case Q_FLIP:
@@ -4038,9 +4115,9 @@ static void be_blit(uint32_t src_va, uint32_t dst_va, uint32_t w, uint32_t h)
         if (g.rt[i].va == src_va && g.rt[i].w == w && g.rt[i].h == h) { s = &g.rt[i]; break; }
     if (!s) { logf_("blit 0x%08X -> 0x%08X %ux%u: no such source surface\n", src_va, dst_va, w, h); return; }
     memset(&fake, 0, sizeof fake);
-    fake.color_va = dst_va; fake.width = w; fake.height = h; fake.pitch = w * 4;
-    fake.bytes_per_pixel = 4; fake.aa_sx = fake.aa_sy = 1;
-    d = get_rt(&fake);
+    fake.color_va = dst_va; fake.width = w; fake.height = h; fake.pitch = w * s->bytes_per_pixel;
+    fake.bytes_per_pixel = s->bytes_per_pixel; fake.aa_sx = fake.aa_sy = 1;
+    d = get_rt(&fake, s->color_format);
     if (!d) return;
     s = NULL;
     for (i = 0; i < g.nrt; i++)

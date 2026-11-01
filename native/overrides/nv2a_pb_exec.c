@@ -551,9 +551,13 @@ static uint32_t attr_elem_bytes(const VertexAttr *a)
 /* Read attribute `a` of vertex `index` as floats. Only the float and the
  * normalised-byte types appear in practice; anything else returns 0 so a
  * caller sees a degenerate vertex rather than reading past the array. */
+/* Verification must read the exact bytes uploaded to the GPU. Guest arrays
+ * can be reused while stream-output readback stalls the executor. */
+static const uint8_t *s_vertex_snapshot;
+static uint32_t s_vertex_snapshot_bytes;
+
 static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
 {
-    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     const uint8_t *p;
     uint32_t i;
 
@@ -561,7 +565,12 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
     out[3] = 1.0f;
     if (!a->size || !a->stride)
         return 0;
-    if (s_gpu.inline_active) {
+    if (s_vertex_snapshot) {
+        const uint32_t *d = (const uint32_t *)(s_vertex_snapshot + GVS_OFF_ATTR) + 4*(a-s_gpu.attr);
+        uint32_t at = d[0] + index*d[1];
+        if (d[3] || (uint64_t)at + attr_elem_bytes(a) > s_vertex_snapshot_bytes) return 0;
+        p = s_vertex_snapshot + at;
+    } else if (s_gpu.inline_active) {
         /* The batch arrived as INLINE_ARRAY, so `offset` is a byte offset into
          * the buffered payload rather than a guest address -- and 0 is a legal
          * one there, which is why the offset test is on the other side of this
@@ -575,7 +584,7 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
 
         if (!a->offset || !guest_span_ok(at, attr_elem_bytes(a)))
             return 0;
-        p = mem + at;
+        p = (const uint8_t *)xbox_GetMemoryOffset() + at;
     }
 
     switch (a->type) {
@@ -798,6 +807,8 @@ static int backend_draws(void)
     return s_backend && s_backend->draw;
 }
 
+uint32_t nv2a_pbx_surface_color_format(void) { return s_gpu.format & 15u; }
+
 static void current_surface(Nv2aSurface *out)
 {
     out->color_va        = dma_resolve(s_gpu.color_offset);
@@ -1009,7 +1020,8 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
 
     if (mode < 0) {
         const char *v = getenv("RECOMP_TEXDEC_VERIFY");
-        mode = v ? 2 : (getenv("RECOMP_TEXDEC_FAST") ? 1 : 0);
+        const char *fast = getenv("RECOMP_TEXDEC_FAST");
+        mode = v ? 2 : (fast && fast[0] == '1' ? 1 : 0);
     }
     if (mode == 0)
         return nv2a_decode_texture_slow(tex, argb_out);
@@ -2006,91 +2018,7 @@ static int ffp_flip_normals(void)
 
 #include "nv2a_ffp_material.h"
 
-static int lit_color(uint32_t index, float out[4])
-{
-    const float *mv = (const float *)&s_reg[0x0480 / 4];
-    float pos[4], nrm[4], vc[4] = {1,1,1,1}, sc[4] = {0,0,0,1}, e[3], n[3], len;
-    uint32_t mask = s_reg[0x03BC / 4], colmat = s_reg[0x0298 / 4];
-    int i, have_vc;
-
-    if (!s_reg[0x0314 / 4] || !s_gpu.attr[2].size)
-        return 0;
-    if (!fetch_attr(&s_gpu.attr[0], index, pos)
-     || !fetch_attr(&s_gpu.attr[2], index, nrm))
-        return 0;
-    have_vc = fetch_attr(color_attr(), index, vc);
-    fetch_attr(&s_gpu.attr[4], index, sc);
-
-    for (i = 0; i < 3; i++) {
-        e[i] = mv[4 * i] * pos[0] + mv[4 * i + 1] * pos[1]
-             + mv[4 * i + 2] * pos[2] + mv[4 * i + 3];
-        n[i] = mv[4 * i] * nrm[0] + mv[4 * i + 1] * nrm[1]
-             + mv[4 * i + 2] * nrm[2];
-    }
-    len = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
-    if (len > 1e-8f) { n[0] /= len; n[1] /= len; n[2] /= len; }
-    /* Optional (RECOMP_FFP_FLIP_NORMALS): light the side the viewer sees.
-     * Some meshes carry normals that face away from the camera (X-Men
-     * Legends' streets and sidewalks: authentic file data, drawn with culling
-     * off), and lighting them as stored leaves only the light's ambient term
-     * -- black ground. Flipping a normal that points away from the eye is
-     * two-sided lighting with the back material equal to the front one.
-     * This is NOT hardware behaviour: it applies even when the title left
-     * two-sided lighting off (NV097_SET_TWO_SIDE_LIGHT_EN, method 0x17C4,
-     * which X-Men Legends writes as 0), and how the hardware makes such a mesh
-     * look right is not established. So it is a compatibility option a game
-     * project turns on for meshes it has seen need it, and off otherwise, so
-     * it cannot change how any other title is lit.
-     * ponytail: per vertex, not per face; exact for flat ground, a vertex on
-     * a silhouette may pick the other side. */
-    if (ffp_flip_normals() && n[0] * e[0] + n[1] * e[1] + n[2] * e[2] > 0.0f) {
-        n[0] = -n[0]; n[1] = -n[1]; n[2] = -n[2];
-    }
-
-    {
-        float scene[3] = {reg_f(0x0A10), reg_f(0x0A14), reg_f(0x0A18)};
-        float emission[3] = {reg_f(0x03A8), reg_f(0x03AC), reg_f(0x03B0)};
-        hitz_ffp_material_base(out, colmat, scene, emission, vc, sc, reg_f(0x03B4));
-    }
-    for (i = 0; i < NV_LIGHTS; i++) {
-        uint32_t kind = (mask >> (2 * i)) & 3, b = 0x1000 + (uint32_t)i * 0x80;
-        float l[3], att = 1.0f, ndl, amb[3], dif[3];
-        int k;
-
-        if (!kind)
-            continue;
-        if (kind == 1) {                                    /* infinite */
-            l[0] = reg_f(b + 0x34); l[1] = reg_f(b + 0x38); l[2] = reg_f(b + 0x3C);
-        } else {                                            /* local / spot */
-            float d;
-            l[0] = reg_f(b + 0x5C) - e[0];
-            l[1] = reg_f(b + 0x60) - e[1];
-            l[2] = reg_f(b + 0x64) - e[2];
-            d = sqrtf(l[0] * l[0] + l[1] * l[1] + l[2] * l[2]);
-            if (d > reg_f(b + 0x24) && reg_f(b + 0x24) > 0.0f)
-                continue;                                   /* out of range */
-            if (d > 1e-8f) { l[0] /= d; l[1] /= d; l[2] /= d; }
-            att = reg_f(b + 0x68) + reg_f(b + 0x6C) * d + reg_f(b + 0x70) * d * d;
-            att = att > 1e-8f ? 1.0f / att : 1.0f;
-        }
-        ndl = n[0] * l[0] + n[1] * l[1] + n[2] * l[2];
-        if (ndl < 0.0f) ndl = 0.0f;
-        for (k = 0; k < 3; k++) {
-            amb[k] = reg_f(b + 0x00 + 4 * k);
-            dif[k] = reg_f(b + 0x0C + 4 * k);
-            /* COLOR_MATERIAL: 1 in the ambient (bits 2-3) or diffuse (bits
-             * 4-5) field takes that material colour from the vertex. */
-            if (have_vc && ((colmat >> 2) & 3) == 1) amb[k] *= vc[k];
-            if (have_vc && ((colmat >> 4) & 3) == 1) dif[k] *= vc[k];
-            if (((colmat >> 2) & 3) == 2) amb[k] *= sc[k];
-            if (((colmat >> 4) & 3) == 2) dif[k] *= sc[k];
-            out[k] += att * (amb[k] + dif[k] * ndl);
-        }
-    }
-    for (i = 0; i < 4; i++)
-        out[i] = out[i] < 0.0f ? 0.0f : out[i] > 1.0f ? 1.0f : out[i];
-    return 1;
-}
+#include "nv2a_ffp_lighting.inc"
 
 /* One fixed-function vertex, in the shape a vertex program produces. */
 static int ffp_vertex(uint32_t index, Nv2aVshOutput *out)
@@ -3073,17 +3001,9 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
 
     if (no_rc < 0)
         no_rc = getenv("RECOMP_NO_COMBINERS") != NULL;
-    memset(&T, 0, sizeof T);
-    T.mem = (uint8_t *)xbox_GetMemoryOffset();
-    T.bpp = surface_bpp();
-    T.textured = s_gpu.texs[0].valid && !s_xf_no_tex;
-    T.use_rc = s_gpu.rc_seen && !no_rc;
-    T.va = va; T.vb = vb; T.vc = vc;
-
     v[0] = va; v[1] = vb; v[2] = vc;
     a = va->pos; b = vb->pos; c = vc->pos;
-    T.a = a; T.b = b; T.c = c;
-    if (T.bpp != 4 && T.bpp != 2)
+    if (surface_bpp() != 4 && surface_bpp() != 2)
         return;
     if (a[3] <= 0.0f || b[3] <= 0.0f || c[3] <= 0.0f) {
         s_gpu.tris_behind++;
@@ -3104,6 +3024,15 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
         }
         return;
     }
+    /* D3D11 does not use the software rasterizer's large per-triangle state.
+     * Initialize it only after the native-backend early return. */
+    memset(&T, 0, sizeof T);
+    T.mem = (uint8_t *)xbox_GetMemoryOffset();
+    T.bpp = surface_bpp();
+    T.textured = s_gpu.texs[0].valid && !s_xf_no_tex;
+    T.use_rc = s_gpu.rc_seen && !no_rc;
+    T.va = va; T.vb = vb; T.vc = vc;
+    T.a = a; T.b = b; T.c = c;
     for (k = 0; k < 3; k++) {
         if (!s_gpu.xf_seeded)
             s_gpu.xf_min[k] = s_gpu.xf_max[k] = a[k];
@@ -3250,11 +3179,9 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
     planes = near_z ? 2 : 1;
     in[0] = a; in[1] = b; in[2] = c;
     for (i = 0; i < 3; i++) {
-        p0[i] = *in[i];
-        for (j = 0; j < 3; j++)
-            p0[i].pos[j] = in[i]->pos[j] * in[i]->pos[3];
         for (pl = 0; pl < planes; pl++) {
-            float d = xf_clip_dist(&p0[i], pl);
+            float w = in[i]->pos[3];
+            float d = pl == 0 ? w - NV_CLIP_W : in[i]->pos[2] * w - s_xf_o[2] * w;
             if (d != d || d - d != 0.0f)
                 return;                       /* not finite: no position at all */
             if (d < 0.0f)
@@ -3264,6 +3191,13 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
     if (inside) {
         raster_xf_triangle(a, b, c);
         return;
+    }
+    /* Most triangles need no clipping. Copy all interpolants only when a
+     * near-plane crossing actually requires Sutherland-Hodgman. */
+    for (i = 0; i < 3; i++) {
+        p0[i] = *in[i];
+        for (j = 0; j < 3; j++)
+            p0[i].pos[j] = in[i]->pos[j] * in[i]->pos[3];
     }
     n = xf_clip_poly(p0, n, 0, p1);
     if (planes > 1 && n)
@@ -3573,7 +3507,7 @@ static void raster_batch_program(void)
     s_vx_map = 0;
     nu = n;
     if (n >= 4 && vx_dedup_on() &&
-            (batch_uses_program() ? nv2a_vsh_parallel_prepare() : vx_ffp_on())) {
+            (batch_uses_program() ? nv2a_vsh_parallel_prepare() : batch_is_ffp())) {
         nu = vx_dedup_build(n);
         s_vx_map = nu < n;
     }
@@ -3601,7 +3535,7 @@ static void raster_batch_program(void)
             verify = getenv("RECOMP_VX_VERIFY") ? 1 : 0;
         if (!every) { const char *e = getenv("RECOMP_VX_VERIFY_EVERY"); every = e ? (unsigned)atoi(e) : 1; if (!every) every = 1; }
         if (verify && (par > 0 || s_vx_map) &&
-                (batch_uses_program() ? nv2a_vsh_parallel_prepare() : vx_ffp_on())) {
+                (batch_uses_program() ? nv2a_vsh_parallel_prepare() : batch_is_ffp())) {
             Nv2aVshOutput ref;
             batches++;
             mapped += s_vx_map;
@@ -3656,6 +3590,10 @@ static void raster_batch_program(void)
             fprintf(stderr, "  [FFP] lights=%08X colmat=%08X ambient=%g,%g,%g two_side=%08X\n",
                     s_reg[0x03BC / 4], s_reg[0x0298 / 4],
                     reg_f(0x0A10), reg_f(0x0A14), reg_f(0x0A18), s_reg[0x17C4 / 4]);
+            fprintf(stderr, "  [FFP] normal size=%u stride=%u current=%g,%g,%g emission=%g,%g,%g\n",
+                    s_gpu.attr[2].size, s_gpu.attr[2].stride,
+                    s_gpu.imm_attr[2][0], s_gpu.imm_attr[2][1], s_gpu.imm_attr[2][2],
+                    reg_f(0x03A8), reg_f(0x03AC), reg_f(0x03B0));
             for (i = 0; i < n && i < 4; i++) {
                 fetch_attr(&s_gpu.attr[0], s_gpu.idx[i], in);
                 fprintf(stderr, "  [FFP]   v%u (%g %g %g %g) -> (%g %g %g, w %g)\n",

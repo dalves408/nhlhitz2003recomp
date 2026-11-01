@@ -14,9 +14,51 @@ static const char *const s_gf_name[GF_N] = { "prim", "prog", "attr", "big", "spa
 static Nv2aGpuVs s_gvs;
 static uint8_t *s_gvs_blk;
 static float *s_gvs_vout;
+static uint32_t s_gvs_vcount;
+static unsigned long s_gvs_vskipped;
 static unsigned long s_gvs_draws, s_gvs_verts, s_gvs_fb[GF_N], s_gvs_fb_verts;
 static unsigned long s_gvs_vdraws, s_gvs_vverts, s_gvs_vbad_draws, s_gvs_vbad_comp;
 static double s_gvs_vmax_err;
+static unsigned long s_gffp_vdraws, s_gffp_vverts, s_gffp_vbad;
+
+/* The FFP shader shares the raw attribute/index upload and the CPU verifier
+ * with vertex programs. No guest storage survives the synchronous draw. */
+static int gvs_ffp_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_GPU_FFP"); on = e && e[0] == '1';
+        fprintf(stderr,"[GPUFFP] %s (unsupported batches retain CPU rendering)\n",on?"enabled":"disabled");
+    }
+    return on;
+}
+
+static int gvs_ffp_attr_present(const VertexAttr *a)
+{
+    return a->size && a->stride && (s_gpu.inline_active || a->offset) &&
+           (a->type <= 2 || a->type == 4 || a->type == 5 || a->type == 6);
+}
+
+static void gvs_ffp_pack(void)
+{
+    float *c = (float *)(s_gvs_blk + GVS_OFF_CONST);
+    uint32_t opts[4], slots[4];
+    memset(c, 0, GVS_OFF_ATTR);
+    memcpy(c, s_gpu.composite, 64);
+    memcpy(c + 16, &s_reg[0x0480 / 4], 48);
+    c[28] = reg_f(0x0A10); c[29] = reg_f(0x0A14); c[30] = reg_f(0x0A18); c[31] = reg_f(0x03B4);
+    c[32] = reg_f(0x03A8); c[33] = reg_f(0x03AC); c[34] = reg_f(0x03B0);
+    opts[0] = s_reg[0x03BC / 4]; opts[1] = s_reg[0x0298 / 4];
+    opts[2] = s_reg[0x0314 / 4] != 0;
+    opts[3] = ffp_flip_normals();
+    memcpy(c + 36, opts, sizeof opts);
+    memcpy(c + 40, &s_reg[0x1000 / 4], NV_LIGHTS * 0x80);
+    memcpy(c + 74 * 4, nv2a_vsh_constant(59), 16);
+    slots[0] = (uint32_t)(color_attr() - s_gpu.attr);
+    slots[1] = (uint32_t)(texcoord_attr() - s_gpu.attr);
+    slots[2] = gvs_ffp_attr_present(color_attr()); slots[3] = 0;
+    memcpy(c + 75 * 4, slots, sizeof slots);
+}
 
 static void gvs_stats(void)
 {
@@ -33,6 +75,11 @@ static void gvs_stats(void)
     if (s_gvs_vdraws)
         fprintf(stderr, "[GPUVS-VERIFY] draws=%lu verts=%lu mismatching draws=%lu components=%lu max err %.3g\n",
                 s_gvs_vdraws, s_gvs_vverts, s_gvs_vbad_draws, s_gvs_vbad_comp, s_gvs_vmax_err);
+    if (s_gffp_vdraws)
+        fprintf(stderr, "[GPUFFP-VERIFY] draws=%lu verts=%lu mismatching draws=%lu\n",
+                s_gffp_vdraws, s_gffp_vverts, s_gffp_vbad);
+    if (s_gvs_vskipped)
+        fprintf(stderr, "[GPUVS-VERIFY] skipped readbacks=%lu (no GPU output; not compared)\n", s_gvs_vskipped);
 }
 
 static int gvs_fail(int why, uint32_t n)
@@ -43,6 +90,26 @@ static int gvs_fail(int why, uint32_t n)
     return 0;
 }
 
+/* Opt-in standalone arithmetic reproductions, not a readback every frame.
+ * Store packed constants, CPU-decoded attributes and expected position for
+ * the actual failing vertex; the hardware regression can replay this data. */
+static void gvs_ffp_fixture(uint32_t index, const Nv2aVshOutput *ref)
+{
+    static unsigned count;
+    const char *prefix = getenv("RECOMP_GPUFFP_FIXTURE");
+    float data[92][4]; unsigned a; char path[512]; FILE *f;
+    if (!prefix || count >= 8) return;
+    memcpy(data, s_gvs_blk + GVS_OFF_CONST, 76*16);
+    for (a=0;a<16;a++) {
+        if (!fetch_attr(&s_gpu.attr[a],index,data[76+a]))
+            memcpy(data[76+a],s_gpu.imm_attr[a],16);
+    }
+    snprintf(path,sizeof path,"%s_%u.bin",prefix,count++);
+    f=fopen(path,"wb");
+    if (f) { fwrite(data,sizeof data,1,f); fwrite(ref->pos,16,1,f); fclose(f);
+        fprintf(stderr,"[GPUFFP-FIXTURE] %s index=%u\n",path,index); }
+}
+
 /* Compare the GPU's outputs (verify_out) with the interpreter on the same vertices. */
 static void gvs_verify_compare(const uint32_t *idx, uint32_t nidx)
 {
@@ -51,6 +118,9 @@ static void gvs_verify_compare(const uint32_t *idx, uint32_t nidx)
     static int printed;
 
     s_gvs_vdraws++;
+    if (s_gvs.fixed_function) s_gffp_vdraws++;
+    s_vertex_snapshot = s_gvs.block;
+    s_vertex_snapshot_bytes = s_gvs.block_bytes;
     for (k = 0; k < n; k++) {
         Nv2aVshOutput ref;
         float want[29];
@@ -65,6 +135,7 @@ static void gvs_verify_compare(const uint32_t *idx, uint32_t nidx)
         memcpy(want + 12, ref.tex, 64);
         want[28] = fog_factor(ref.fog[0]);
         s_gvs_vverts++;
+        if (s_gvs.fixed_function) s_gffp_vverts++;
         for (c = 0; c < 29; c++) {
             float w = want[c], g = got[c];
             double err, tol;
@@ -74,6 +145,7 @@ static void gvs_verify_compare(const uint32_t *idx, uint32_t nidx)
             err = fabs((double)w - (double)g);
             tol = 1e-3 * fmax(1.0, fabs((double)w)) + 2e-3;
             if (!(err <= tol)) {
+                if (s_gvs.fixed_function && !shown) gvs_ffp_fixture(idx[k], &ref);
                 bad++;
                 s_gvs_vbad_comp++;
                 if (err == err && err < 1e30 && err > s_gvs_vmax_err) s_gvs_vmax_err = err;
@@ -87,6 +159,8 @@ static void gvs_verify_compare(const uint32_t *idx, uint32_t nidx)
     }
     if (bad)
         s_gvs_vbad_draws++;
+    if (bad && s_gvs.fixed_function) s_gffp_vbad++;
+    s_vertex_snapshot = NULL;
 }
 
 static int gvs_try(void)
@@ -102,13 +176,14 @@ static int gvs_try(void)
     float *imm;
     uint32_t *desc;
     const float *c59;
+    int ffp = !batch_uses_program() && batch_is_ffp() && gvs_ffp_on();
 
     if (on < 0) {
         const char *e = getenv("RECOMP_D3D11_GPUVS");
         on = e && e[0] == '1';
         verify = on && getenv("RECOMP_GPUVS_VERIFY") != NULL;
     }
-    if (!on || n < 3 || !batch_uses_program() || !pbx_enabled() || !backend_draws() || !s_gpu.rc_seen)
+    if (!on || n < 3 || (!batch_uses_program() && !ffp) || !pbx_enabled() || !backend_draws() || !s_gpu.rc_seen)
         return 0;
     if (s_bcount)
         return gvs_fail(GF_STATE, n);
@@ -131,10 +206,17 @@ static int gvs_try(void)
         return gvs_fail(GF_PRIM, n);
 
     memset(&s_gvs, 0, sizeof s_gvs);
-    if (!nv2a_vsh_export(&s_gvs))
+    if (ffp) {
+        if (!gvs_ffp_attr_present(&s_gpu.attr[0])) return gvs_fail(GF_ATTR, n);
+        s_gvs.fixed_function = 1;
+        s_gvs.hash = 0xFF010001u;
+        s_gvs.input_mask = (1u << 0) | (1u << 2) | (1u << 4) |
+            (1u << (color_attr() - s_gpu.attr)) | (1u << (texcoord_attr() - s_gpu.attr)) |
+            (1u << 10) | (1u << 11) | (1u << 12);
+    } else if (!nv2a_vsh_export(&s_gvs))
         return gvs_fail(GF_PROG, n);
     c59 = nv2a_vsh_constant(59);
-    if (c59[2] != 0.0f)
+    if (!ffp && c59[2] != 0.0f)
         return gvs_fail(GF_ZOFF, n);
 
     if (!s_gvs_blk && !(s_gvs_blk = (uint8_t *)malloc(GVS_BLOCK_MAX)))
@@ -145,6 +227,7 @@ static int gvs_try(void)
         static unsigned long vcount;
         s_gvs.verify = (verify && s_gvs_vout && (vcount < 60 || (vcount % 250) == 0)) ? 1 : 0;
         s_gvs.verify_out = s_gvs.verify ? s_gvs_vout : NULL;
+        s_gvs.verify_count = s_gvs.verify ? &s_gvs_vcount : NULL;
         vcount++;
     }
     if (!nv2a_gpuvs_probe(&s_gvs))
@@ -171,7 +254,11 @@ static int gvs_try(void)
 
         if (!((s_gvs.input_mask >> a) & 1u))
             continue;
-        if (!at->size && a < NV_VERTEX_ATTRS) {
+        if (ffp && !gvs_ffp_attr_present(at)) {
+            if (a == 2) memcpy(&imm[a * 4], s_gpu.imm_attr[a], 16);
+            continue;
+        }
+        if (!ffp && !at->size && a < NV_VERTEX_ATTRS) {
             memcpy(&imm[a * 4], s_gpu.imm_attr[a], 16);
             continue;
         }
@@ -234,6 +321,7 @@ static int gvs_try(void)
         desc[a * 4 + 3] = 0;
     }
     memcpy(s_gvs_blk + GVS_OFF_CONST, nv2a_vsh_constant(0), NV2A_VSH_CONSTANTS * 16u);   /* one contiguous table */
+    if (ffp) gvs_ffp_pack();
 
     /* triangle-list index array, in the CPU path's assembly order */
     ib = (uint32_t *)(s_gvs_blk + GVS_OFF_IDX);
@@ -276,9 +364,9 @@ static int gvs_try(void)
 
     /* the CPU path's per-batch bookkeeping */
     xf_set_viewport();
-    s_xf_no_tex = 0;                             /* batch_uses_program() is true */
-    s_gpu.batches_program++;
-    s_gpu.verts_program += n;
+    s_xf_no_tex = ffp && !(texcoord_attr()->offset && texcoord_attr()->stride);
+    if (ffp) s_gpu.batches_ffp++;
+    else { s_gpu.batches_program++; s_gpu.verts_program += n; }
     if (s_gpu.blend_enable) {
         uint32_t pair = s_gpu.blend_sfactor << 16 | (s_gpu.blend_dfactor & 0xFFFF);
         int j;
@@ -323,10 +411,20 @@ static int gvs_try(void)
     }
     s_bkind = 1;
     s_pbx_gvs = &s_gvs;
+    s_gvs_vcount = 0;
     backend_flush_gvs(nidx);
     s_pbx_gvs = NULL;
-    if (s_gvs.verify)
-        gvs_verify_compare((const uint32_t *)(s_gvs_blk + GVS_OFF_IDX), nidx);
+    if (s_gvs.verify) {
+        if (s_gvs_vcount == (nidx > 4096 ? 4096 : nidx))
+            gvs_verify_compare((const uint32_t *)(s_gvs_blk + GVS_OFF_IDX), nidx);
+        else {
+            Nv2aSurface surface;
+            current_surface(&surface);
+            if (++s_gvs_vskipped <= 8)
+                fprintf(stderr, "[GPUVS-VERIFY] no readback: hash=%08X surface=%08X %ux%u bpp=%u\n",
+                        s_gvs.hash, surface.color_va, surface.width, surface.height, surface.bytes_per_pixel);
+        }
+    }
     s_gvs_draws++;
     s_gvs_verts += n;
     gvs_stats();

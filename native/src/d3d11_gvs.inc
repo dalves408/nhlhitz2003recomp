@@ -4,6 +4,7 @@
  * vs_5_0 (cached by the microcode's hash); every draw reads its data from one raw
  * ByteAddressBuffer ring. */
 #include "d3d11_gvs_hlsl.h"
+#include "d3d11_ffp_body.h"
 
 #define GVS_RING_BYTES (32u * 1024u * 1024u)
 #define GVS_SPEC_MAX   1024
@@ -12,6 +13,7 @@
 
 typedef struct {
     uint32_t hash;
+    uint32_t fixed_function;
     ID3D11VertexShader *vs;          /* NULL: compile failed (cached) */
     ID3D11VertexShader *vs_v;        /* verify variant (raw program oPos), made on demand */
     ID3D11GeometryShader *gs_v;      /* its stream-out pass-through */
@@ -23,6 +25,7 @@ static GvsSpec s_gspec[GVS_SPEC_MAX];
 static uint32_t s_ngspec, s_gspec_fail, s_gspec_ms;
 static ID3D11Buffer *s_gring, *s_gcb, *s_so_buf, *s_so_stage;
 static ID3D11ShaderResourceView *s_gring_srv;
+static ID3D11Query *s_so_query;
 static uint32_t s_gring_off;
 static int s_gstate;                  /* 0 not tried, 1 ready, -1 unavailable */
 static unsigned long s_gdraws, s_gverts, s_gmapfail, s_gbytes;
@@ -137,8 +140,7 @@ static DWORD WINAPI gvs_job_main(LPVOID arg)
     ID3D11VertexShader *vs = NULL;
 
     if (blob) {
-        if (FAILED(ID3D11Device_CreateVertexShader(g.dev, ID3D10Blob_GetBufferPointer(blob),
-                                                   ID3D10Blob_GetBufferSize(blob), NULL, &vs)))
+        if (FAILED(shader_create_vs(blob, &vs)))
             vs = NULL;
         ID3D10Blob_Release(blob);
     }
@@ -153,8 +155,10 @@ static DWORD WINAPI gvs_job_main(LPVOID arg)
 static int gvs_async_on(void)
 {
     static int on = -1;
-    if (on < 0)
-        on = getenv("RECOMP_D3D11_GPUVS_ASYNC") != NULL;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_D3D11_GPUVS_ASYNC");
+        on = e && e[0] == '1';
+    }
     return on;
 }
 
@@ -167,6 +171,13 @@ static int gvs_init(void)
 
 /* Find or compile the shader of `e`'s program; NULL if it cannot be drawn on the GPU. */
 static GvsSpec *gvs_get_u(const Nv2aGpuVs *e, int want_verify);
+static int gvs_gen_body(const Nv2aGpuVs *e, char *out, size_t cap)
+{
+    if (!e->fixed_function) return nv2a_vsh_gen_hlsl(e, out, cap);
+    if (sizeof k_hlsl_ffp_body > cap) return 0;
+    memcpy(out, k_hlsl_ffp_body, sizeof k_hlsl_ffp_body);
+    return 1;
+}
 static GvsSpec *gvs_get(const Nv2aGpuVs *e, int want_verify)
 {
     GvsSpec *r;
@@ -184,7 +195,7 @@ static GvsSpec *gvs_get_u(const Nv2aGpuVs *e, int want_verify)
     DWORD t0;
 
     for (i = 0; i < s_ngspec; i++)
-        if (s_gspec[i].hash == e->hash) { sp = &s_gspec[i]; break; }
+        if (s_gspec[i].hash == e->hash && s_gspec[i].fixed_function == e->fixed_function) { sp = &s_gspec[i]; break; }
     if (sp && sp->pending) {
         if (!sp->ready)
             return NULL;                 /* still compiling: the CPU path draws meanwhile */
@@ -199,8 +210,9 @@ static GvsSpec *gvs_get_u(const Nv2aGpuVs *e, int want_verify)
         sp = &s_gspec[s_ngspec++];
         memset(sp, 0, sizeof *sp);
         sp->hash = e->hash;
+        sp->fixed_function = e->fixed_function;
         body = (char *)malloc(1u << 20);
-        if (body && nv2a_vsh_gen_hlsl(e, body, 1u << 20)
+        if (body && gvs_gen_body(e, body, 1u << 20)
             && (src = gvs_assemble(body, 0, &len)) != NULL) {
             GvsJob *j = (GvsJob *)malloc(sizeof *j);
             if (j) {
@@ -222,15 +234,15 @@ static GvsSpec *gvs_get_u(const Nv2aGpuVs *e, int want_verify)
         sp = &s_gspec[s_ngspec++];
         memset(sp, 0, sizeof *sp);
         sp->hash = e->hash;
+        sp->fixed_function = e->fixed_function;
         t0 = GetTickCount();
         body = (char *)malloc(1u << 20);
-        if (body && nv2a_vsh_gen_hlsl(e, body, 1u << 20)
+        if (body && gvs_gen_body(e, body, 1u << 20)
             && (src = gvs_assemble(body, 0, &len)) != NULL) {
             blob = compile_hlsl_src(src, len, "vs_gpu", "vs_5_0");
             free(src);
             if (blob) {
-                if (FAILED(ID3D11Device_CreateVertexShader(g.dev, ID3D10Blob_GetBufferPointer(blob),
-                                                           ID3D10Blob_GetBufferSize(blob), NULL, &sp->vs)))
+                if (FAILED(shader_create_vs(blob, &sp->vs)))
                     sp->vs = NULL;
                 ID3D10Blob_Release(blob);
             }
@@ -252,12 +264,11 @@ static GvsSpec *gvs_get_u(const Nv2aGpuVs *e, int want_verify)
         UINT stride = GVS_VFLOATS * 4u;
         sp->vtried = 1;
         body = (char *)malloc(1u << 20);
-        if (body && nv2a_vsh_gen_hlsl(e, body, 1u << 20)
+        if (body && gvs_gen_body(e, body, 1u << 20)
             && (src = gvs_assemble(body, 1, &len)) != NULL) {
             blob = compile_hlsl_src(src, len, "vs_gpu", "vs_5_0");
             if (blob) {
-                if (FAILED(ID3D11Device_CreateVertexShader(g.dev, ID3D10Blob_GetBufferPointer(blob),
-                                                           ID3D10Blob_GetBufferSize(blob), NULL, &sp->vs_v)))
+                if (FAILED(shader_create_vs(blob, &sp->vs_v)))
                     sp->vs_v = NULL;
                 ID3D10Blob_Release(blob);
             }
@@ -297,9 +308,14 @@ static void gvs_verify_run(const GvsSpec *sp, const Nv2aGpuVs *gv)
     D3D11_MAPPED_SUBRESOURCE m;
     uint32_t n = gv->nidx > GVS_VMAX ? GVS_VMAX : gv->nidx;
     UINT so_off = 0;
+    D3D11_QUERY_DATA_SO_STATISTICS stats;
 
     if (!gv->verify_out || !sp->vs_v || !sp->gs_v || !n)
         return;
+    if (!s_so_query) {
+        D3D11_QUERY_DESC q = {D3D11_QUERY_SO_STATISTICS, 0};
+        if (FAILED(ID3D11Device_CreateQuery(g.dev, &q, &s_so_query))) return;
+    }
     if (!s_so_buf) {
         memset(&bd, 0, sizeof bd);
         bd.ByteWidth = GVS_VMAX * GVS_VFLOATS * 4u;
@@ -317,7 +333,9 @@ static void gvs_verify_run(const GvsSpec *sp, const Nv2aGpuVs *gv)
     ID3D11DeviceContext_GSSetShader(g.ctx, sp->gs_v, NULL, 0);
     ID3D11DeviceContext_SOSetTargets(g.ctx, 1, &s_so_buf, &so_off);
     ID3D11DeviceContext_PSSetShader(g.ctx, NULL, NULL, 0);
+    ID3D11DeviceContext_Begin(g.ctx, (ID3D11Asynchronous *)s_so_query);
     ID3D11DeviceContext_Draw(g.ctx, n, 0);
+    ID3D11DeviceContext_End(g.ctx, (ID3D11Asynchronous *)s_so_query);
     {
         ID3D11Buffer *none = NULL;
         ID3D11DeviceContext_SOSetTargets(g.ctx, 1, &none, &so_off);
@@ -327,6 +345,13 @@ static void gvs_verify_run(const GvsSpec *sp, const Nv2aGpuVs *gv)
     if (SUCCEEDED(ID3D11DeviceContext_Map(g.ctx, (ID3D11Resource *)s_so_stage, 0, D3D11_MAP_READ, 0, &m))) {
         memcpy(gv->verify_out, m.pData, (size_t)n * GVS_VFLOATS * 4u);
         ID3D11DeviceContext_Unmap(g.ctx, (ID3D11Resource *)s_so_stage, 0);
+        if (gv->verify_count) *gv->verify_count = n;
+        if (ID3D11DeviceContext_GetData(g.ctx, (ID3D11Asynchronous *)s_so_query, &stats, sizeof stats, 0) == S_OK
+                && stats.NumPrimitivesWritten != n) {
+            if (gv->verify_count) *gv->verify_count = 0;
+            logf_("GPUVS verify stream-out: expected %u points, wrote %llu (needed %llu) hash %08X\n",
+                  n, stats.NumPrimitivesWritten, stats.PrimitivesStorageNeeded, gv->hash);
+        }
     }
 }
 

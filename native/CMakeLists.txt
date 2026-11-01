@@ -14,6 +14,17 @@ project(nhl_hitz_2003_recomp C)
 
 add_executable(hitz_ffp_material_test EXCLUDE_FROM_ALL tests/ffp_material_test.c)
 target_include_directories(hitz_ffp_material_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides")
+add_executable(hitz_ffp_lighting_test EXCLUDE_FROM_ALL tests/ffp_lighting_test.c)
+target_include_directories(hitz_ffp_lighting_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides")
+add_executable(hitz_rt_format_test EXCLUDE_FROM_ALL tests/rt_format_test.c)
+target_link_libraries(hitz_rt_format_test PRIVATE d3d11 d3dcompiler)
+add_executable(hitz_nis_lifetime_test EXCLUDE_FROM_ALL tests/nis_lifetime_test.c src/hitz_nis.c)
+add_executable(hitz_ffp_gpu_math_test EXCLUDE_FROM_ALL tests/ffp_gpu_math_test.c)
+target_link_libraries(hitz_ffp_gpu_math_test PRIVATE d3d11 d3dcompiler)
+add_executable(hitz_shader_prepare tools/shader_prepare.c)
+target_link_libraries(hitz_shader_prepare PRIVATE d3dcompiler)
+add_executable(hitz_shader_cache_test EXCLUDE_FROM_ALL tests/shader_cache_test.c)
+target_link_libraries(hitz_shader_cache_test PRIVATE d3dcompiler)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -73,10 +84,23 @@ target_include_directories(xbox_kernel PRIVATE "${XBOXRECOMP_DIR}/src")
 # is silently left out of the build and shows up as unresolved externals.
 file(GLOB RECOMP_GEN_SOURCES CONFIGURE_DEPENDS "src/recomp/gen/*.c")
 
+# Keep direct calls routed through the project-owned NIS lifetime fix without
+# editing generated sources. Retain the original body as a renamed reference.
+set(nis_generated "${CMAKE_CURRENT_SOURCE_DIR}/src/recomp/gen/recomp_0029.c")
+if(EXISTS "${nis_generated}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${nis_generated}")
+    file(READ "${nis_generated}" nis_source)
+    string(REPLACE "void sub_00147AE0(void)\n{" "void hitz_original_00147AE0(void)\n{" nis_source "${nis_source}")
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/recomp_nis.c" "${nis_source}")
+    list(REMOVE_ITEM RECOMP_GEN_SOURCES "${nis_generated}")
+    list(APPEND RECOMP_GEN_SOURCES "${CMAKE_CURRENT_BINARY_DIR}/recomp_nis.c")
+endif()
+
 # Core game sources
 set(GAME_SOURCES
     src/main.c
     src/recomp_manual.c
+    src/hitz_nis.c
     # Add game-specific sources here, e.g.:
     # src/asset_loader.c
     # src/custom_renderer.c
@@ -109,6 +133,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp hitz_renderer)
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/recomp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/recomp/gen
     ${XBOXRECOMP_DIR}/include
 )
 
