@@ -377,9 +377,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     hitz_debug_init();
 #endif
 
-    /* Unbuffered output for immediate visibility during debugging */
+#ifndef XRDBG
+    /* Unbuffered output for immediate visibility during debugging. The debug
+     * kit sets up both streams itself (and has written to them already, after
+     * which the CRT does not allow re-buffering). */
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
+#endif
 
     printf("=== NHL Hitz 2003 - Static Recompilation ===\n");
     printf("Loading XBE...\n");

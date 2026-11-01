@@ -1,2 +1,2 @@
-Vendored unchanged from https://github.com/dalves408/nhlhitzpro-recomp (branch debug-kit, commit 4cda338f6fb24b6efd6b20c6ec53c2302a9dc3af).
+Vendored unchanged from https://github.com/dalves408/nhlhitzpro-recomp (branch debug-kit, commit 5a5f4bf1ad65c25e1a1d47b23953125236b3d5fe).
 Do not edit these files here; NHL Hitz 2003 glue is native/src/hitz_debug.c. Update by re-copying the branch.
