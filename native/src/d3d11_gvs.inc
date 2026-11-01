@@ -310,6 +310,7 @@ static void gvs_verify_run(const GvsSpec *sp, const Nv2aGpuVs *gv)
     UINT so_off = 0;
     D3D11_QUERY_DATA_SO_STATISTICS stats;
 
+    batch_flush();
     if (!gv->verify_out || !sp->vs_v || !sp->gs_v || !n)
         return;
     if (!s_so_query) {
@@ -327,22 +328,22 @@ static void gvs_verify_run(const GvsSpec *sp, const Nv2aGpuVs *gv)
         bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         if (FAILED(ID3D11Device_CreateBuffer(g.dev, &bd, NULL, &s_so_stage))) return;
     }
-    ID3D11DeviceContext_IASetInputLayout(g.ctx, NULL);
-    ID3D11DeviceContext_IASetPrimitiveTopology(g.ctx, D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
-    ID3D11DeviceContext_VSSetShader(g.ctx, sp->vs_v, NULL, 0);
+    bind_layout(g.ctx, NULL);
+    bind_topology(g.ctx, D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
+    bind_vs(g.ctx, sp->vs_v, NULL, 0);
     ID3D11DeviceContext_GSSetShader(g.ctx, sp->gs_v, NULL, 0);
     ID3D11DeviceContext_SOSetTargets(g.ctx, 1, &s_so_buf, &so_off);
-    ID3D11DeviceContext_PSSetShader(g.ctx, NULL, NULL, 0);
+    bind_ps(g.ctx, NULL, NULL, 0);
     ID3D11DeviceContext_Begin(g.ctx, (ID3D11Asynchronous *)s_so_query);
-    ID3D11DeviceContext_Draw(g.ctx, n, 0);
+    batch_draw_immediate(g.ctx, n, 0);
     ID3D11DeviceContext_End(g.ctx, (ID3D11Asynchronous *)s_so_query);
     {
         ID3D11Buffer *none = NULL;
         ID3D11DeviceContext_SOSetTargets(g.ctx, 1, &none, &so_off);
     }
     ID3D11DeviceContext_GSSetShader(g.ctx, NULL, NULL, 0);
-    ID3D11DeviceContext_CopyResource(g.ctx, (ID3D11Resource *)s_so_stage, (ID3D11Resource *)s_so_buf);
-    if (SUCCEEDED(ID3D11DeviceContext_Map(g.ctx, (ID3D11Resource *)s_so_stage, 0, D3D11_MAP_READ, 0, &m))) {
+    batch_copy(g.ctx, (ID3D11Resource *)s_so_stage, (ID3D11Resource *)s_so_buf);
+    if (SUCCEEDED(batch_map(g.ctx, (ID3D11Resource *)s_so_stage, 0, D3D11_MAP_READ, 0, &m))) {
         memcpy(gv->verify_out, m.pData, (size_t)n * GVS_VFLOATS * 4u);
         ID3D11DeviceContext_Unmap(g.ctx, (ID3D11Resource *)s_so_stage, 0);
         if (gv->verify_count) *gv->verify_count = n;
@@ -365,42 +366,45 @@ static int gvs_draw(const Nv2aGpuVs *gv, const RcConsts *rcc,
     GvsConsts gc;
     ID3D11Buffer *pcb[2];
     uint32_t bb = (gv->block_bytes + 15u) & ~15u, mode;
+    uint64_t began;
 
     sp = gvs_get(gv, gv->verify);
     if (!sp || bb > GVS_RING_BYTES) return 0;
     if (s_gring_off + bb > GVS_RING_BYTES) s_gring_off = 0, mode = D3D11_MAP_WRITE_DISCARD;
     else mode = s_gring_off ? D3D11_MAP_WRITE_NO_OVERWRITE : D3D11_MAP_WRITE_DISCARD;
-    if (FAILED(ID3D11DeviceContext_Map(g.ctx, (ID3D11Resource *)s_gring, 0, (D3D11_MAP)mode, 0, &m))) {
+    began=work_timing_on()?qpc_us():0;
+    if (FAILED(batch_map(g.ctx, (ID3D11Resource *)s_gring, 0, (D3D11_MAP)mode, 0, &m))) {
         s_gmapfail++;
         return 0;
     }
+    if(began)s_ring_map_us+=qpc_us()-began;
+    began=work_timing_on()?qpc_us():0;
     memcpy((uint8_t *)m.pData + s_gring_off, gv->block, gv->block_bytes);
     ID3D11DeviceContext_Unmap(g.ctx, (ID3D11Resource *)s_gring, 0);
+    if(began)s_ring_copy_us+=qpc_us()-began;
+    s_ring_bytes+=gv->block_bytes;
 
     memset(&gc, 0, sizeof gc);
     gc.gbase = s_gring_off;
     gc.aa_sx = gv->aa_sx; gc.aa_sy = gv->aa_sy;
     gc.fog_mode = gv->fog_mode; gc.fog_px = gv->fog_px; gc.fog_py = gv->fog_py;
-    if (FAILED(ID3D11DeviceContext_Map(g.ctx, (ID3D11Resource *)s_gcb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
-        return 0;
-    memcpy(m.pData, &gc, sizeof gc);
-    ID3D11DeviceContext_Unmap(g.ctx, (ID3D11Resource *)s_gcb, 0);
+    if (FAILED(upload_constants(g.ctx, s_gcb, &gc, sizeof gc))) return 0;
     s_gring_off += bb;
     s_gbytes += gv->block_bytes;
 
-    ID3D11DeviceContext_IASetInputLayout(g.ctx, NULL);
-    ID3D11DeviceContext_VSSetConstantBuffers(g.ctx, 0, 1, &g.cb);
-    ID3D11DeviceContext_VSSetConstantBuffers(g.ctx, 2, 1, &s_gcb);
-    ID3D11DeviceContext_VSSetShaderResources(g.ctx, 0, 1, &s_gring_srv);
-    if (gv->verify) gvs_verify_run(sp, gv);
-    ID3D11DeviceContext_IASetPrimitiveTopology(g.ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    ID3D11DeviceContext_VSSetShader(g.ctx, sp->vs, NULL, 0);
+    bind_layout(g.ctx, NULL);
+    bind_vscb(g.ctx, 0, 1, &g.cb);
+    bind_vscb(g.ctx, 2, 1, &s_gcb);
+    bind_vssrv(g.ctx, 0, 1, &s_gring_srv);
+    if (gv->verify) { bind_invalidate(); gvs_verify_run(sp, gv); bind_invalidate(); }
+    bind_topology(g.ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    bind_vs(g.ctx, sp->vs, NULL, 0);
     pcb[0] = g.cb; pcb[1] = g.cb_rc;
-    ID3D11DeviceContext_PSSetShader(g.ctx, rc_get_ps(rcc), NULL, 0);
-    ID3D11DeviceContext_PSSetConstantBuffers(g.ctx, 0, 2, pcb);
-    ID3D11DeviceContext_PSSetShaderResources(g.ctx, 0, 4, rc_srv);
-    ID3D11DeviceContext_PSSetSamplers(g.ctx, 0, 4, rc_smp);
-    ID3D11DeviceContext_Draw(g.ctx, gv->nidx, 0);
+    bind_ps(g.ctx, rc_get_ps(rcc), NULL, 0);
+    bind_pscb(g.ctx, 0, 2, pcb);
+    bind_pssrv(g.ctx, 0, 4, rc_srv);
+    bind_samplers(g.ctx, 0, 4, rc_smp);
+    batch_draw_immediate(g.ctx, gv->nidx, 0);
     s_gdraws++;
     s_gverts += gv->nidx;
     g.draws++;

@@ -53,9 +53,17 @@ static void gen_src(GenBuf *b, const DecSrc *d)
         gen_pf(b, ".%c%c%c%c", sw[d->sw[0]], sw[d->sw[1]], sw[d->sw[2]], sw[d->sw[3]]);
 }
 
+static int s_export_cache_mode=-1;
+static uint64_t s_export_hits, s_export_misses;
+void nv2a_vsh_export_stats(uint64_t *hits,uint64_t *misses)
+{ *hits=s_export_hits;*misses=s_export_misses; }
+
 int nv2a_vsh_export(Nv2aGpuVs *e)
 {
     static int diag = -1;
+    static int valid;
+    static uint32_t version,start,cxt;
+    static Nv2aGpuVs cached;
     uint32_t s, n = 0, h = 2166136261u;
 
     if (diag < 0)
@@ -63,6 +71,13 @@ int nv2a_vsh_export(Nv2aGpuVs *e)
                 || getenv("RECOMP_VSH_CHECK")) ? 1 : 0;
     if (diag)
         return 0;
+    if(s_export_cache_mode<0){const char *v=getenv("RECOMP_VSH_EXPORT_CACHE");s_export_cache_mode=!v || atoi(v)!=0;}
+    if(s_export_cache_mode && valid && version==s_prog_version && start==s_start_slot && cxt==s_cxt_write){
+        memcpy(e->prog,cached.prog,cached.nslots*sizeof cached.prog[0]);
+        e->nslots=cached.nslots;e->hash=cached.hash;e->input_mask=cached.input_mask;
+        s_export_hits++;return 1;
+    }
+    s_export_misses++;
     e->input_mask = 0;
     for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++) {
         const DecIns *d;
@@ -83,6 +98,11 @@ int nv2a_vsh_export(Nv2aGpuVs *e)
         if (d->final) {
             e->nslots = n;
             e->hash = h;
+            if(s_export_cache_mode){
+                memcpy(cached.prog,e->prog,n*sizeof e->prog[0]);
+                cached.nslots=n;cached.hash=h;cached.input_mask=e->input_mask;
+                version=s_prog_version;start=s_start_slot;cxt=s_cxt_write;valid=1;
+            }
             return 1;
         }
     }

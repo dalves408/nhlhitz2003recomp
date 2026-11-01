@@ -3492,6 +3492,7 @@ static void vxs_end(uint32_t n, int par)
 #define VXS_END(n, par) ((void)0)
 #endif
 
+static int progress_logs(void);
 #include "nv2a_gvs_exec.inc"
 
 static void raster_batch_program(void)
@@ -3837,6 +3838,22 @@ static void frame_trace_flip(void)
     }
 }
 
+static int s_progress_logs = -1;
+void nv2a_pbx_progress_logs(int enabled) { s_progress_logs = enabled != 0; }
+static int progress_logs(void)
+{
+    if (s_progress_logs < 0) {
+        const char *e = getenv("RECOMP_RENDER_PROGRESS");
+        s_progress_logs = !e || atoi(e) != 0;
+    }
+    return s_progress_logs;
+}
+static int attribute_log_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_ATTRLOG") != NULL;
+    return on;
+}
 static void draw_primitive(void)
 {
     float v[4];
@@ -3845,7 +3862,7 @@ static void draw_primitive(void)
     if (!s_gpu.prim || !s_gpu.idx_count)
         return;
     s_gpu.draws++;
-    if ((s_gpu.draws % 200) == 0)
+    if ((s_gpu.draws % 200) == 0 && progress_logs())
         fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
     s_gpu.verts += s_gpu.idx_count;
 
@@ -4086,7 +4103,7 @@ static void draw_inline_array(void)
         off += (bytes + 3u) & ~3u;
     }
     vsize = off;
-    if (getenv("RECOMP_ATTRLOG")) {
+    if (attribute_log_enabled()) {
         static int nn;
         if (nn++ < 40 && (s_gpu.flips % 100) == 0) {
             fprintf(stderr, "[ATTRLOG] inline_array flip %u vsize %u inline_dwords %u saved strides/types/sizes:", s_gpu.flips, vsize, s_gpu.inline_count);
@@ -4110,7 +4127,7 @@ static void draw_inline_array(void)
     s_gpu.idx_count = count;
 
     s_gpu.inline_active = 1;
-    if (getenv("RECOMP_ATTRLOG")) {
+    if (attribute_log_enabled()) {
         static unsigned shown;
         if (shown++ < 30) {
             const float *vp = nv2a_vsh_constant(59);
@@ -4443,6 +4460,8 @@ static void flip_hold_report(void)
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
+    if ((subch==0 && ((method==NV097_NO_OPERATION && param) || method==NV097_FLIP_INCREMENT_WRITE || method==NV097_FLIP_STALL)) ||
+        (subch==5 && method==0x0310)) nv2a_gpu_flush_pending();
     if (subch == 0 && method == 0x1D6C) s_sem_offset = param;
     if (subch == 0 && method == 0x1D70 && getenv("RECOMP_SEM_LOG")) {
         static unsigned shown;
@@ -4455,6 +4474,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      * semaphore word; SET_SEMAPHORE_OFFSET is not added (in X-Men Legends it
      * held 0xFF000000 at times, which put the write outside guest memory). */
     if (subch == 0 && method == 0x1D70 && s_sem_va) {
+        nv2a_gpu_flush_pending();
         uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
         *(volatile uint32_t *)(mem + s_sem_va) = param;
         return;
@@ -5013,6 +5033,27 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     }
 }
 
+#include "nv2a_bulk_append.h"
+static int s_bulk_mode = -1;
+static uint64_t s_bulk_words, s_bulk_packets;
+void nv2a_pbx_bulk_mode(int enabled) { s_bulk_mode = enabled != 0; }
+void nv2a_pbx_bulk_stats(uint64_t *words, uint64_t *packets) { *words=s_bulk_words;*packets=s_bulk_packets; }
+/* Only side-effect-free non-incrementing payload ports qualify. Execute the
+ * first word normally for initialization, then preserve the port's final
+ * register value. GET/PUT, END/draw, semaphores and interrupts stay in the
+ * original scanner/executor paths. */
+uint32_t nv2a_pb_exec_bulk(uint32_t subch, uint32_t method, const uint32_t *data, uint32_t n)
+{
+    if(s_bulk_mode<0){const char *e=getenv("RECOMP_PB_BULK");s_bulk_mode=e && atoi(e)!=0;}
+    if(!s_bulk_mode || subch || n<2 || (method!=0x1800 && method!=0x1808 && method!=0x1818))return 0;
+    nv2a_pb_exec_method(subch,method,data[0]);
+    hitz_bulk_append(method,s_gpu.prim,s_gpu.idx,&s_gpu.idx_count,NV_MAX_INDICES,
+        s_gpu.inline_buf,&s_gpu.inline_count,NV_MAX_INLINE,data+1,n-1);
+    s_reg[method/4]=data[n-1];
+    s_bulk_words+=n;s_bulk_packets++;
+    return n;
+}
+
 /* Find where the title actually wrote its quad.
  *
  * The GPU is pointed at a buffer that stays zero, which says the data went
@@ -5165,8 +5206,23 @@ static void peek_chain(void)
     fflush(stderr);
 }
 
+static int s_report_mode=-1;
+void nv2a_pbx_report_mode(int enabled){s_report_mode=enabled!=0;}
+int nv2a_pb_exec_report_requested(void)
+{
+    static int diagnostic=-1;
+    if(diagnostic<0){
+        static const char *const flags[]={"RECOMP_FB_DUMP","RECOMP_PEEK","RECOMP_PEEK_CHAIN",
+            "RECOMP_FIND_NAN","RECOMP_FIND_QUAD","RECOMP_TEX_STATE","RECOMP_PB_UNHANDLED_ALL",
+            "RECOMP_PB_SCAN","RECOMP_NV2A_TRACE","RECOMP_VX_STATS","RECOMP_NIS_TRACE"};
+        unsigned i;diagnostic=0;
+        for(i=0;i<sizeof flags/sizeof flags[0];i++)if(getenv(flags[i]))diagnostic=1;
+    }
+    return diagnostic || (s_report_mode>=0?s_report_mode:progress_logs());
+}
 void nv2a_pb_exec_report(void)
 {
+    if(!nv2a_pb_exec_report_requested())return;
     peek_addresses();
     peek_chain();
     if (getenv("RECOMP_FIND_NAN")) {

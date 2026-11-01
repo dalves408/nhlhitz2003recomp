@@ -20,6 +20,22 @@ static unsigned long s_gvs_draws, s_gvs_verts, s_gvs_fb[GF_N], s_gvs_fb_verts;
 static unsigned long s_gvs_vdraws, s_gvs_vverts, s_gvs_vbad_draws, s_gvs_vbad_comp;
 static double s_gvs_vmax_err;
 static unsigned long s_gffp_vdraws, s_gffp_vverts, s_gffp_vbad;
+static uint64_t s_gvs_prepare_us,s_gvs_submit_us,s_gvs_guest_bytes;
+static int gvs_timing_on(void)
+{
+    static int on=-1;
+    if(on<0){const char *v=getenv("RECOMP_RENDER_TIMING");on=v && atoi(v)!=0;}
+    return on;
+}
+static uint64_t gvs_clock_us(void)
+{
+    static LARGE_INTEGER frequency;LARGE_INTEGER now;
+    if(!frequency.QuadPart)QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&now);
+    return (uint64_t)(now.QuadPart*1000000ull/frequency.QuadPart);
+}
+void nv2a_pbx_gvs_work_stats(uint64_t out[3])
+{out[0]=s_gvs_prepare_us;out[1]=s_gvs_submit_us;out[2]=s_gvs_guest_bytes;}
 
 /* The FFP shader shares the raw attribute/index upload and the CPU verifier
  * with vertex programs. No guest storage survives the synchronous draw. */
@@ -66,6 +82,7 @@ static void gvs_stats(void)
     char fb[160];
     int i, o = 0;
 
+    if (!progress_logs() && !s_gvs_vdraws) return;
     if ((calls++ % 3000) != 1)
         return;
     for (i = 0; i < GF_N; i++)
@@ -163,7 +180,7 @@ static void gvs_verify_compare(const uint32_t *idx, uint32_t nidx)
     s_vertex_snapshot = NULL;
 }
 
-static int gvs_try(void)
+static int gvs_try_impl(void)
 {
     static int on = -1, verify = -1;
     uint32_t n = s_gpu.idx_count, nidx, i, a, minidx = 0xFFFFFFFFu, maxidx = 0, pos, ni;
@@ -320,8 +337,8 @@ static int gvs_try(void)
         desc[a * 4 + 2] = at->type | (at->size < 4 ? at->size : 4u) << 8;
         desc[a * 4 + 3] = 0;
     }
-    memcpy(s_gvs_blk + GVS_OFF_CONST, nv2a_vsh_constant(0), NV2A_VSH_CONSTANTS * 16u);   /* one contiguous table */
-    if (ffp) gvs_ffp_pack();
+    if (ffp) gvs_ffp_pack(); /* fills its own constants; do not copy a table immediately overwritten */
+    else memcpy(s_gvs_blk + GVS_OFF_CONST, nv2a_vsh_constant(0), NV2A_VSH_CONSTANTS * 16u);
 
     /* triangle-list index array, in the CPU path's assembly order */
     ib = (uint32_t *)(s_gvs_blk + GVS_OFF_IDX);
@@ -355,6 +372,7 @@ static int gvs_try(void)
     }
     s_gvs.block = s_gvs_blk;
     s_gvs.block_bytes = pos;
+    s_gvs_guest_bytes+=copied;
     s_gvs.nidx = nidx;
     s_gvs.aa_sx = s_gpu.aa_sx;
     s_gvs.aa_sy = s_gpu.aa_sy;
@@ -412,7 +430,9 @@ static int gvs_try(void)
     s_bkind = 1;
     s_pbx_gvs = &s_gvs;
     s_gvs_vcount = 0;
-    backend_flush_gvs(nidx);
+    {uint64_t began=gvs_timing_on()?gvs_clock_us():0;
+     backend_flush_gvs(nidx);
+     if(began)s_gvs_submit_us+=gvs_clock_us()-began;}
     s_pbx_gvs = NULL;
     if (s_gvs.verify) {
         if (s_gvs_vcount == (nidx > 4096 ? 4096 : nidx))
@@ -429,4 +449,13 @@ static int gvs_try(void)
     s_gvs_verts += n;
     gvs_stats();
     return 1;
+}
+
+static int gvs_try(void)
+{
+    uint64_t began=gvs_timing_on()?gvs_clock_us():0, submitted=s_gvs_submit_us;
+    int result=gvs_try_impl();
+    if(began){uint64_t elapsed=gvs_clock_us()-began,nested=s_gvs_submit_us-submitted;
+        if(elapsed>=nested)s_gvs_prepare_us+=elapsed-nested;}
+    return result;
 }

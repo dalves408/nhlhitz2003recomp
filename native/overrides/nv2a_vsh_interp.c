@@ -88,9 +88,11 @@ void nv2a_vsh_set_load_slot(uint32_t slot)
 void nv2a_vsh_program_word(uint32_t word)
 {
     if (s_load_slot < NV2A_VSH_SLOTS) {
-        s_program[s_load_slot][s_load_word] = word;
-        s_dec[s_load_slot].valid = 0;                  /* project override */
-        s_prog_version++;
+        if (s_program[s_load_slot][s_load_word] != word) {
+            s_program[s_load_slot][s_load_word] = word;
+            s_dec[s_load_slot].valid = 0;
+            s_prog_version++;
+        }
     }
     if (++s_load_word == 4) {
         s_load_word = 0;
@@ -141,7 +143,7 @@ void nv2a_vsh_set_constant(uint32_t index, const float v[4])
 
 void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4])
 {
-    if (slot < NV2A_VSH_SLOTS) {
+    if (slot < NV2A_VSH_SLOTS && memcmp(s_program[slot], words, sizeof s_program[slot])) {
         memcpy(s_program[slot], words, sizeof s_program[slot]);
         s_dec[slot].valid = 0;                         /* project override */
         s_prog_version++;

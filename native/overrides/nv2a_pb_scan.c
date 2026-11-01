@@ -25,6 +25,7 @@
 #include <stddef.h>   /* ptrdiff_t */
 #include <stdlib.h>
 #include <string.h>
+#include <windows.h>
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -43,7 +44,10 @@ static uint32_t s_tot_calls;
 /* Executing is opt-in separately from surveying: a survey is read-only, while
  * the executor writes to guest memory. */
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
+extern uint32_t nv2a_pb_exec_bulk(uint32_t subch, uint32_t method, const uint32_t *data, uint32_t n);
+extern void nv2a_gpu_flush_pending(void);
 extern void nv2a_pb_exec_report(void);
+extern int nv2a_pb_exec_report_requested(void);
 static int s_exec_enabled = -1;
 static int s_scan_enabled = -1;
 
@@ -155,11 +159,18 @@ static const char *nv097_name(uint32_t m)
 void nv2a_pb_scan_report(void)
 {
     int i;
+    LARGE_INTEGER before={0}, after={0}, frequency={0};
+    int timing;
+    if(!nv2a_pb_exec_report_requested())return;
+    timing=getenv("RECOMP_REPORT_TIMING")!=NULL;
+    if(timing){QueryPerformanceFrequency(&frequency);QueryPerformanceCounter(&before);}
 
     if (s_exec_enabled > 0) {
         nv2a_pb_exec_report();
         fprintf(stderr, "[PB] %u pushbuffer calls followed\n", s_tot_calls);
     }
+    if(timing && frequency.QuadPart){QueryPerformanceCounter(&after);fprintf(stderr,"[REPORT-TIME] tick_ms=%llu wall_ms=%.3f\n",
+        (unsigned long long)GetTickCount64(),1000.0*(double)(after.QuadPart-before.QuadPart)/(double)frequency.QuadPart);}
     if (!s_seen_count || !getenv("RECOMP_PB_SCAN"))
         return;
     fprintf(stderr, "[PB] %u segments, %u words, %u jumps, %u calls,"
@@ -278,9 +289,20 @@ void nv2a_pb_resync(uint32_t get_phys)
  * executor, up to PUT. */
 static void pb_consume(const uint8_t *mem, uint32_t put, uint32_t *words)
 {
+    int tried_bulk = 0;
     while (s_pend_left && s_get < PB_RAM_BYTES && s_get != put) {
         uint32_t m = s_pend_noninc ? s_pend_method : s_pend_method + s_pend_i * 4;
         uint32_t param = *(const uint32_t *)(mem + (0x80000000u | s_get));
+
+        if(!tried_bulk && s_exec_enabled && !s_scan_enabled && s_pend_noninc){
+            uint32_t n=s_pend_left, available=(PB_RAM_BYTES-s_get)/4;
+            tried_bulk=1;
+            if(put>s_get && available>(put-s_get)/4)available=(put-s_get)/4;
+            if(n>available)n=available;
+            if(n>1 && nv2a_pb_exec_bulk(s_pend_subch,m,(const uint32_t*)(mem+(0x80000000u|s_get)),n)==n){
+                s_get=(s_get+n*4)&PB_PHYS_MASK;s_pend_i+=n;s_pend_left-=n;*words+=n;continue;
+            }
+        }
 
         if (s_scan_enabled) note(s_pend_subch, m);
         /* Same walk, two consumers: the survey counts, the executor
@@ -417,6 +439,7 @@ void nv2a_pb_scan(uint32_t put_phys)
         unknown++;
     }
 
+    if (s_exec_enabled) nv2a_gpu_flush_pending();
     if (get_reg) {                            /* what the poll thread writes too */
         *get_reg = s_get;
         s_pub = s_get;
@@ -514,6 +537,13 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
             uint32_t method =  w & 0x1FFCu;
             int noninc = (w & 0xE0000000u) == 0x40000000u;
 
+            if(noninc && s_exec_enabled && !s_scan_enabled && va<end_va){
+                uint32_t n=count, available=(end_va-va)/4;
+                if(n>available)n=available;
+                if(n>1 && nv2a_pb_exec_bulk(subch,method,(const uint32_t*)(mem+va),n)==n){
+                    va+=n*4;words+=n;continue;
+                }
+            }
             for (uint32_t i = 0; i < count && va < end_va; i++) {
                 uint32_t m = noninc ? method : method + i * 4;
                 if (s_scan_enabled) note(subch, m);   /* the inventory is only read by a survey */
@@ -545,6 +575,8 @@ void nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va)
         nv2a_pb_exec_walk_begin();      /* the flip hold's vblank */
     }
     words = pb_walk_segment(start_va, end_va, 0, &jumps, &unknown);
+    /* Submit owned pending draws before the caller publishes consumed GET. */
+    if (s_exec_enabled) nv2a_gpu_flush_pending();
 
     s_tot_words += words;
     s_tot_unknown += unknown;

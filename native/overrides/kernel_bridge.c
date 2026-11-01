@@ -4201,6 +4201,8 @@ static int bridge_is_cdrom_device(const char *path)
     return _stricmp(path, "\\Device\\CdRom0") == 0;
 }
 
+#include "hitz_disc_buffering.h"
+#include "hitz_io_timing.inc"
 /* Open a file by delegating to the ported xbox_NtCreateFile kernel HLE.
  * bridge_create_file_impl, below, wraps this with the per-attempt log. */
 static NTSTATUS bridge_create_file_open(
@@ -4213,6 +4215,8 @@ static NTSTATUS bridge_create_file_open(
     XBOX_IO_STATUS_BLOCK   ios;
     HANDLE   h  = NULL;
     NTSTATUS st;
+    ULONG host_options;
+    static int buffered=-1;
 
     bridge_build_oa(obj_attrs_va, &oa, &name);
     *name_out = name;
@@ -4231,12 +4235,17 @@ static NTSTATUS bridge_create_file_open(
     }
 
     memset(&ios, 0, sizeof(ios));
+    if(buffered<0){const char *v=getenv("RECOMP_DISC_BUFFERED");buffered=v && atoi(v)!=0;}
+    host_options=hitz_disc_host_options(name.Buffer,name.Length,(uint32_t)access,
+                                       (uint32_t)disposition,(uint32_t)options,buffered);
 
     st = xbox_NtCreateFile(&h, access, &oa, &ios, NULL,
-                           file_attrs, share, disposition, options);
+                           file_attrs, share, disposition, host_options);
 
     if (NT_SUCCESS(st)) {
         bridge_write_handle(handle_va, h);
+        if(handle_va)io_timing_note_open(BRIDGE_MEM32(handle_va),name.Buffer,name.Length,
+            (uint32_t)access,(uint32_t)disposition,(uint32_t)options,(uint32_t)host_options);
         bridge_write_iostatus(iostatus_va, ios.Status, (uint32_t)ios.Information);
     } else {
         bridge_write_iostatus(iostatus_va, st, 0);
@@ -4774,6 +4783,7 @@ static void bridge_NtReadFile(void)
     XBOX_IO_STATUS_BLOCK ios;
     LARGE_INTEGER  off = {0};
     PLARGE_INTEGER poff = NULL;
+    LONGLONG read_started;
 
     memset(&ios, 0, sizeof(ios));
     if (!bridge_buf_ok(buffer_va, length, "NtReadFile")) {
@@ -4809,13 +4819,19 @@ static void bridge_NtReadFile(void)
     }
     { extern void hitz_nis_read_trace(uint32_t, uint32_t, int64_t);
       hitz_nis_read_trace(buffer_va, length, off.QuadPart); }
+    read_started=io_timing_begin();
     g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
                 XBOX_TO_NATIVE(buffer_va), length, poff);
+    io_timing_end(read_started,STACK_ARG(0),poff?off.QuadPart:-1,length,
+        (uint32_t)ios.Information,(uint32_t)ios.Status,g_xbox_kernel_caller,buffer_va);
 
     /* What a read actually delivered. A decoder that rejects its input cannot
      * say whether the bytes were wrong or the read was, and the two look
      * identical from inside the title -- the first bytes settle it. */
     {
+        static int read_log=-1;
+        if(read_log<0){const char *e=getenv("RECOMP_READ_LOG");read_log=!e || atoi(e)!=0 || getenv("RECOMP_NIS_TRACE") || getenv("RECOMP_READ_CAPTURE");}
+        if(read_log){
         const uint8_t *p = (const uint8_t *)XBOX_TO_NATIVE(buffer_va);
         uint32_t got = (uint32_t)ios.Information;
         /* The offset matters as much as the length. A title streaming a pack
@@ -4838,6 +4854,7 @@ static void bridge_NtReadFile(void)
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
                     got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
         fflush(stderr);
+        }
     }
     bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
     bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),
@@ -10908,8 +10925,12 @@ static void kernel_thunk_dispatch_body(void)
     }
 
     {
+        static int summary_on=-1;
         static DWORD last_summary_tick = 0;
-        DWORD now = GetTickCount();
+        DWORD now;
+        if(summary_on<0){const char *e=getenv("RECOMP_KERNEL_SUMMARY");summary_on=!e || atoi(e)!=0;}
+        if(summary_on){
+        now = GetTickCount();
         if (last_summary_tick == 0) last_summary_tick = now;
         if (now - last_summary_tick >= 2000 && g_kernel_call_count > 200) {
             fprintf(stderr, "  [KERNEL] summary: %lld total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
@@ -10938,6 +10959,7 @@ static void kernel_thunk_dispatch_body(void)
             }
             fflush(stderr);
             last_summary_tick = now;
+        }
         }
     }
 

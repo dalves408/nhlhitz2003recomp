@@ -63,6 +63,7 @@ int nv2a_gpuvs_probe(const Nv2aGpuVs *e);
 
 /* nv2a_vsh_interp.c (project): the active program, and its HLSL body. */
 int nv2a_vsh_export(Nv2aGpuVs *e);
+void nv2a_vsh_export_stats(uint64_t *hits,uint64_t *misses);
 int nv2a_vsh_gen_hlsl(const Nv2aGpuVs *e, char *out, size_t cap);
 typedef struct {
     const Nv2aVertexExt *ext;
@@ -80,5 +81,13 @@ const Nv2aBatchExt *nv2a_pbx_current(void);
 /* Valid while a synchronous backend callback executes; async backends must
  * record it beside the surface, just like the draw's combiner state. */
 uint32_t nv2a_pbx_surface_color_format(void);
+/* Periodic progress only; diagnostic traces and errors remain independent. */
+void nv2a_pbx_progress_logs(int enabled);
+void nv2a_pbx_report_mode(int enabled);
+void nv2a_gpu_flush_pending(void);
+void nv2a_pbx_bulk_mode(int enabled);
+void nv2a_pbx_bulk_stats(uint64_t *words, uint64_t *packets);
+void nv2a_pbx_gvs_work_stats(uint64_t out[3]);
+void nv2a_pbx_ack_yield_mode(int every);
 
 #endif

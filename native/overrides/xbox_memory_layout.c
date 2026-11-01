@@ -1349,12 +1349,15 @@ static void framebuffer_probe_tick(void)
 {
     static DWORD last_ms;
     static uint32_t last_sum;
-    DWORD now = GetTickCount();
+    static int requested=-1;
+    DWORD now;
     uint32_t sum = 0, nonzero = 0, i, n;
     const uint32_t *p;
 
-    if (!s_nv2a_trace || !s_fb_va || !s_fb_pitch)
+    if(requested<0){const char *v=getenv("RECOMP_FB_PROBE");requested=s_nv2a_trace_kicks || getenv("RECOMP_PB_SCAN") || (v && atoi(v)!=0);}
+    if (!requested || !s_fb_va || !s_fb_pitch)
         return;
+    now=GetTickCount();
     if (last_ms && (now - last_ms) < 1000)
         return;
     last_ms = now;
@@ -1436,9 +1439,17 @@ volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset)
     return (volatile uint32_t *)((char *)g_nv2a_memory + offset);
 }
 
+/* Experimental polling cadence: 1 preserves the original Sleep(0) each pass.
+ * Larger values use CPU pause between bounded yields. No acknowledgement,
+ * clock, GET publication or command-execution rule changes. */
+static volatile LONG s_ack_yield_every=-1;
+void nv2a_pbx_ack_yield_mode(int every)
+{s_ack_yield_every=every<1?1:every>64?64:every;}
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
+    unsigned yield_passes=0;
+    if(s_ack_yield_every<0){const char *v=getenv("RECOMP_ACK_YIELD_EVERY");nv2a_pbx_ack_yield_mode(v?atoi(v):1);}
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
         /* A flip held for its vblank (nv2a_flip_hold.h): this pass walks
          * nothing, leaves DMA_GET where it is and acknowledges no PFB flush,
@@ -1645,7 +1656,9 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
         *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
                                + g_memory_offset) = GetTickCount();
 
-        Sleep(0);  /* yield; the waiter is spinning on another core */
+        if(s_ack_yield_every<=1 || ++yield_passes>=(unsigned)s_ack_yield_every){
+            yield_passes=0;Sleep(0);
+        } else YieldProcessor();
     }
     return 0;
 }

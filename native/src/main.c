@@ -419,6 +419,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
      * which also stops the vblank tick -- 5/10 s in-match freezes. Two match
      * runs with it on: 0 freezes vs 22 without (STATUS.md). */
     if (!getenv("RECOMP_DISPATCH_GATE")) _putenv_s("RECOMP_DISPATCH_GATE", "1");
+    /* Read-only extracted disc assets use the host cache; saves/writes keep
+     * their requested flags. Byte/EOF tests and gameplay read timing verified. */
+    if (!getenv("RECOMP_DISC_BUFFERED")) _putenv_s("RECOMP_DISC_BUFFERED", "1");
     if (!getenv("RECOMP_VBLANK")) _putenv_s("RECOMP_VBLANK", "paced");
     if (!getenv("RECOMP_D3D11")) _putenv_s("RECOMP_D3D11", "1");
     if (getenv("RECOMP_D3D11")[0] == '1') {
@@ -441,6 +444,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         if (!getenv("RECOMP_TEXDEC_FAST")) _putenv_s("RECOMP_TEXDEC_FAST", "1");
         if (!getenv("RECOMP_D3D11_SHADERCACHE")) _putenv_s("RECOMP_D3D11_SHADERCACHE", "1");
         if (!getenv("RECOMP_SHADER_PREWARM")) _putenv_s("RECOMP_SHADER_PREWARM", "1");
+        /* Hardware binding/readback tests and same-match crossover verified. */
+        if (!getenv("RECOMP_D3D11_STATECACHE")) _putenv_s("RECOMP_D3D11_STATECACHE", "1");
+        if (!getenv("RECOMP_D3D11_CONSTCACHE")) _putenv_s("RECOMP_D3D11_CONSTCACHE", "1");
+#ifdef XRDBG
+        if (!getenv("RECOMP_RENDER_PROGRESS")) _putenv_s("RECOMP_RENDER_PROGRESS", "1");
+        if (!getenv("RECOMP_KERNEL_SUMMARY")) _putenv_s("RECOMP_KERNEL_SUMMARY", "1");
+        if (!getenv("RECOMP_READ_LOG")) _putenv_s("RECOMP_READ_LOG", "1");
+        if (!getenv("RECOMP_FB_PROBE")) _putenv_s("RECOMP_FB_PROBE", "1");
+#else
+        if (!getenv("RECOMP_RENDER_PROGRESS")) _putenv_s("RECOMP_RENDER_PROGRESS", "0");
+        if (!getenv("RECOMP_KERNEL_SUMMARY")) _putenv_s("RECOMP_KERNEL_SUMMARY", "0");
+        if (!getenv("RECOMP_READ_LOG")) _putenv_s("RECOMP_READ_LOG", "0");
+        if (!getenv("RECOMP_FB_PROBE")) _putenv_s("RECOMP_FB_PROBE", "0");
+#endif
+        if (!getenv("RECOMP_PB_BULK")) _putenv_s("RECOMP_PB_BULK", "1");
         if (!getenv("RECOMP_D3D11_SHAREZ")) _putenv_s("RECOMP_D3D11_SHAREZ", "1");
         if (!getenv("RECOMP_NV_BLIT")) _putenv_s("RECOMP_NV_BLIT", "1");
         if (!getenv("RECOMP_INLINE_SHORTFIX")) _putenv_s("RECOMP_INLINE_SHORTFIX", "1");
