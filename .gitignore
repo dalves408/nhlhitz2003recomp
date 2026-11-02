@@ -7,7 +7,6 @@ game_files/
 native/game
 runtime/
 /game/
-/NHLHitz03.7z
 
 # Generated C is derived from the game binary: regenerate with scripts/prepare.py
 native/src/recomp/gen/
@@ -29,22 +28,10 @@ build/
 *.lib
 *.dmp
 *.bmp
-!native/installer/wizard_small_*.bmp
-/native/installer/Output/
 *.log
 shadercache/
 *.hsrc
 native/xbox_kernel.log
-
-# ── Local tools and archives not part of the project ──
-tools/renderdoc/
-tools/xiso/
-tools/xiso.zip
-tools/Xbox-XBERecomp/
-_hitzpro_discarded/
-
-# Superseded working note (kept locally only)
-STATUS_AND_HANDOFF_CLAUDE.md
 
 # ── Python / editors / OS ──
 __pycache__/
@@ -54,4 +41,3 @@ __pycache__/
 .idea/
 Thumbs.db
 .DS_Store
-.codex-remote-attachments/
