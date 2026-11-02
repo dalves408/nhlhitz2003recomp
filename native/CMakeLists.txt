@@ -11,13 +11,33 @@ cmake_minimum_required(VERSION 3.20)
 # ============================================================================
 
 project(nhl_hitz_2003_recomp C)
+option(NHL_RELEASE "Packaged player build with user-writable data paths and quiet output" OFF)
+option(HITZ_DEBUGKIT "Debug build with the xrdbg self-monitoring kit" OFF)
+set(HITZ_PACKAGE_VERSION "1.0.0" CACHE STRING "Installer and executable version")
+if(NHL_RELEASE AND NOT HITZ_DEBUGKIT)
+    set(HITZ_PLAYER_BUILD ON)
+    add_compile_definitions(HITZ_PLAYER_BUILD=1)
+    if(MSVC)
+        add_compile_options("$<$<COMPILE_LANGUAGE:C>:/FI${CMAKE_CURRENT_SOURCE_DIR}/src/player_environment.h>")
+    else()
+        add_compile_options("$<$<COMPILE_LANGUAGE:C>:-include${CMAKE_CURRENT_SOURCE_DIR}/src/player_environment.h>")
+    endif()
+endif()
+if(NOT HITZ_PACKAGE_VERSION MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+$")
+    message(FATAL_ERROR "HITZ_PACKAGE_VERSION must have three numeric components")
+endif()
+string(REPLACE "." "," HITZ_FILE_VERSION "${HITZ_PACKAGE_VERSION}")
+if(NHL_RELEASE AND MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
+endif()
 
 add_executable(hitz_ffp_material_test EXCLUDE_FROM_ALL tests/ffp_material_test.c)
+add_executable(hitz_player_environment_test EXCLUDE_FROM_ALL tests/player_environment_test.c)
 target_include_directories(hitz_ffp_material_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides")
 add_executable(hitz_ffp_lighting_test EXCLUDE_FROM_ALL tests/ffp_lighting_test.c)
 target_include_directories(hitz_ffp_lighting_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides")
 add_executable(hitz_rt_format_test EXCLUDE_FROM_ALL tests/rt_format_test.c)
-target_link_libraries(hitz_rt_format_test PRIVATE d3d11 d3dcompiler)
+target_link_libraries(hitz_rt_format_test PRIVATE d3d11 d3dcompiler dxgi dxguid)
 add_executable(hitz_nis_lifetime_test EXCLUDE_FROM_ALL tests/nis_lifetime_test.c src/hitz_nis.c)
 add_executable(hitz_ffp_gpu_math_test EXCLUDE_FROM_ALL tests/ffp_gpu_math_test.c)
 target_link_libraries(hitz_ffp_gpu_math_test PRIVATE d3d11 d3dcompiler)
@@ -74,14 +94,24 @@ function(hitz_runtime_overrides target)
     endforeach()
 endfunction()
 hitz_runtime_overrides(xbox_kernel nv2a_pb_exec.c nv2a_pb_scan.c
-    nv2a_vsh_interp.c nv2a_combiner.c kernel_bridge.c kernel_hal.c xbox_memory_layout.c)
+    nv2a_vsh_interp.c nv2a_combiner.c kernel_bridge.c kernel_hal.c xbox_memory_layout.c kernel_path.c kernel_file.c)
 hitz_runtime_overrides(host_time host_time.c)
 hitz_runtime_overrides(xbox_apu apu_xaudio2.c)
 hitz_runtime_overrides(xbox_usb usb_gamepad.c ohci.c)
+hitz_runtime_overrides(xbox_input keyboard.c)
+target_include_directories(xbox_input PRIVATE "${XBOXRECOMP_DIR}/src/input")
+if(NHL_RELEASE)
+    hitz_runtime_overrides(xbox_kernel kernel_thunks.c)
+    target_compile_definitions(xbox_kernel PRIVATE NHL_RELEASE=1)
+endif()
 target_include_directories(host_time PRIVATE "${XBOXRECOMP_DIR}/src/platform")
 target_include_directories(xbox_apu PRIVATE "${XBOXRECOMP_DIR}/src/apu")
 target_include_directories(xbox_usb PRIVATE "${XBOXRECOMP_DIR}/src/usb")
 target_include_directories(xbox_kernel PRIVATE "${XBOXRECOMP_DIR}/src")
+
+add_executable(hitz_virtual_disk_test EXCLUDE_FROM_ALL tests/virtual_disk_test.c)
+target_include_directories(hitz_virtual_disk_test PRIVATE "${XBOXRECOMP_DIR}/src/kernel")
+target_link_libraries(hitz_virtual_disk_test PRIVATE xboxrecomp)
 
 # ── Recompiled game executable ──────────────────────────────────
 
@@ -121,7 +151,7 @@ set(GAME_SOURCES
 add_library(hitz_renderer OBJECT src/backend_d3d11.c)
 target_include_directories(hitz_renderer PRIVATE
     "${XBOXRECOMP_DIR}/src" "${XBOXRECOMP_DIR}/src/kernel")
-if(MSVC)
+if(MSVC AND NOT HITZ_PLAYER_BUILD)
     target_compile_options(hitz_renderer PRIVATE /Zi)
 endif()
 
@@ -135,6 +165,30 @@ add_executable(${PROJECT_NAME} WIN32
     ${GAME_SOURCES}
     ${RECOMP_GEN_SOURCES}
 )
+
+if(WIN32)
+    enable_language(RC)
+    configure_file(resources/game.rc.in ${CMAKE_CURRENT_BINARY_DIR}/game.rc @ONLY)
+    configure_file(resources/config.rc.in ${CMAKE_CURRENT_BINARY_DIR}/config.rc @ONLY)
+    target_sources(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/game.rc)
+    target_include_directories(${PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/resources")
+    add_executable(nhl_import installer/nhl_import.c)
+    target_link_libraries(nhl_import PRIVATE bcrypt shell32)
+    add_executable(nhl_config WIN32 config/config.c ${CMAKE_CURRENT_BINARY_DIR}/config.rc)
+    target_include_directories(nhl_config PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/resources")
+    target_link_libraries(nhl_config PRIVATE comctl32 user32 gdi32 shell32)
+    set_target_properties(nhl_config PROPERTIES OUTPUT_NAME config)
+    add_executable(hitz_player_settings_test EXCLUDE_FROM_ALL tests/player_settings_test.c)
+    target_include_directories(hitz_player_settings_test PRIVATE "${XBOXRECOMP_DIR}/src/input" "${XBOXRECOMP_DIR}/include")
+    target_link_libraries(hitz_player_settings_test PRIVATE xbox_input_map comctl32 user32 gdi32 shell32)
+    if(MSVC)
+        set_property(TARGET nhl_import nhl_config PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
+    endif()
+endif()
+if(NHL_RELEASE)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE NHL_RELEASE=1)
+    target_compile_definitions(hitz_renderer PRIVATE NHL_RELEASE=1)
+endif()
 
 # Link against the xboxrecomp umbrella target (all 6 runtime libraries)
 target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp hitz_renderer)
@@ -160,20 +214,26 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     winmm
     # Lets the fault handler resolve the host RIP back to the generated
     # function's symbol, i.e. to the guest function that faulted.
-    dbghelp
+    $<$<NOT:$<BOOL:${HITZ_PLAYER_BUILD}>>:dbghelp>
 )
 
 # MSVC-specific: large address aware, increase section limit for big generated files
 if(MSVC)
     # Keep optimized runtime function symbols: otherwise sampling resolves
     # static graphics routines to unrelated neighboring public symbols.
-    target_compile_options(xbox_kernel PRIVATE /Zi)
     target_link_options(${PROJECT_NAME} PRIVATE
         /LARGEADDRESSAWARE
-        /DEBUG /OPT:REF /OPT:ICF
+        /OPT:REF /OPT:ICF
     )
     # The generated code files can be very large. Increase object file section limit.
-    target_compile_options(${PROJECT_NAME} PRIVATE /bigobj /MP4 /Zi)
+    target_compile_options(${PROJECT_NAME} PRIVATE /bigobj /MP4)
+    if(HITZ_PLAYER_BUILD)
+        target_link_options(${PROJECT_NAME} PRIVATE /DEBUG:NONE)
+    else()
+        target_compile_options(xbox_kernel PRIVATE /Zi)
+        target_compile_options(${PROJECT_NAME} PRIVATE /Zi)
+        target_link_options(${PROJECT_NAME} PRIVATE /DEBUG)
+    endif()
 endif()
 
 # ── Debug kit (xrdbg) ───────────────────────────────────────────
@@ -182,7 +242,6 @@ endif()
 # guest RAM, DEL marks a glitch (screenshots), controller log, PDB. See
 # DEBUG-KIT.md. Never on in a normal build; configure it in its own directory:
 #   cmake -S native -B native/build-debug -G "Visual Studio 17 2022" -A x64 -DHITZ_DEBUGKIT=ON
-option(HITZ_DEBUGKIT "Debug build with the xrdbg self-monitoring kit" OFF)
 set(HITZ_DEBUG_TAG "debug" CACHE STRING "Build tag printed in the debug log header and banner")
 if(HITZ_DEBUGKIT)
     set(XRDBG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../tools/xrdbg")

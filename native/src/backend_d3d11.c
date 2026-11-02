@@ -27,6 +27,7 @@
 #include <dbghelp.h>      /* types only (RECOMP_FLIPTIME_PROF); dbghelp.dll is loaded at run time */
 #include <d3d11.h>
 #include <dxgi.h>
+#include "d3d11_device.h"
 #include <d3dcompiler.h>
 #include <wincodec.h>     /* texture replacement pack (WIC decodes the PNG/BMP files) */
 #include <ctype.h>
@@ -303,6 +304,14 @@ static void cfg_put_s(const char *sec, const char *key, int v)
 
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
 
+#ifdef NHL_RELEASE
+#define DEFAULT_FRAME_RATE 60
+#define DEFAULT_HIRES 0
+#else
+#define DEFAULT_FRAME_RATE 0
+#define DEFAULT_HIRES 1
+#endif
+
 static void settings_load(void)
 {
     const char *e = getenv("RECOMP_D3D11_SCALE");
@@ -317,7 +326,7 @@ static void settings_load(void)
     s_stretch = cfg_get("stretch", 0) != 0;
     {   /* the game's frame rate is the rate of the display it is told it has; saved as that number of hertz */
         const char *present = getenv("RECOMP_PRESENT_HZ");
-        int hz = present ? atoi(present) : cfg_get("frame_rate", 0), i, best = 0, bd = 1 << 30;
+        int hz = present ? atoi(present) : cfg_get("frame_rate", DEFAULT_FRAME_RATE), i, best = 0, bd = 1 << 30;
         s_present_override = present ? (atoi(present) > 0 ? atoi(present) : 0) : -1;
         if (hz >= 360) hz = 0; /* legacy "uncapped up to 360" setting */
         for (i = 0; i < 6; i++)
@@ -333,7 +342,7 @@ static void settings_load(void)
     {   /* hi-res texture pack: the master switch and one switch per kind of texture */
         static const char *const k[5] = { "rink", "logos", "jerseys", "glow", "other" };
         int i;
-        s_hires = cfg_get_s("textures", "enabled", 1) != 0;
+        s_hires = cfg_get_s("textures", "enabled", DEFAULT_HIRES) != 0;
         for (i = 0; i < 5; i++) s_cat_on[i] = cfg_get_s("textures", k[i], 1) != 0;
         pack_init();
     }
@@ -864,6 +873,25 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 static int init_pipeline(void);
 static void shader_prewarm(void);
 
+static FILE *open_graphics_report(void)
+{
+#if defined(NHL_RELEASE) || defined(XRDBG)
+    WCHAR path[MAX_PATH];
+    DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA",path,MAX_PATH);
+    if (!length || length > MAX_PATH - 40) return NULL;
+    wcscat_s(path,MAX_PATH,L"\\NHLHitz2003");
+    CreateDirectoryW(path,NULL);
+#ifdef XRDBG
+    wcscat_s(path,MAX_PATH,L"\\debug");
+    CreateDirectoryW(path,NULL);
+#endif
+    wcscat_s(path,MAX_PATH,L"\\graphics.txt");
+    return _wfopen(path,L"w+b");
+#else
+    return NULL;
+#endif
+}
+
 static int init_window_and_device(void)
 {
     WNDCLASSA wc;
@@ -903,9 +931,29 @@ static int init_window_and_device(void)
     if (f11_on() && (getenv("RECOMP_D3D11_FULLSCREEN")
         ? atoi(getenv("RECOMP_D3D11_FULLSCREEN")) != 0 : want_fullscreen_at_start())) toggle_fullscreen(g.hwnd);
 
+#ifndef HITZ_PLAYER_BUILD
     if (getenv("RECOMP_D3D11_DEBUG")) flags |= D3D11_CREATE_DEVICE_DEBUG;
-    hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, flags, want, 3,
-                           D3D11_SDK_VERSION, &g.dev, &fl, &g.ctx);
+#endif
+    {
+        FILE *report = open_graphics_report();
+#ifdef XRDBG
+        /* Keep selection failures in the session even if a separate report cannot be opened. */
+        if (!report) report = stderr;
+#endif
+        hr = hitz_create_graphics_device(flags, want, 3, &g.dev, &fl, &g.ctx, report);
+#ifdef XRDBG
+        if (report && report != stderr) {
+            char line[1024];
+            fflush(report);
+            rewind(report);
+            while (fgets(line,sizeof line,report)) fprintf(stderr,"[GPU] %s",line);
+            fprintf(stderr,"[GPU] D3D11 device result=0x%08lX feature_level=0x%X\n",
+                (unsigned long)hr,SUCCEEDED(hr) ? (unsigned)fl : 0);
+            fflush(stderr);
+        }
+#endif
+        if (report && report != stderr) fclose(report);
+    }
     if (FAILED(hr)) {
         logf_("D3D11CreateDevice failed 0x%08lX\n", (unsigned long)hr);
         g.failed = 1;
@@ -3152,6 +3200,7 @@ static void dump_rts(void)
     }
 }
 
+#ifndef HITZ_PLAYER_BUILD
 /* RECOMP_FLIPTIME helper: CPU time (ms) of every thread of this process, by thread id. */
 #define TS_MAX 128
 typedef struct { DWORD tid; uint64_t cpu100ns; } ThreadCpu;
@@ -3321,6 +3370,8 @@ static void sampler_report(LONG from, LONG to, const ThreadCpu *busy, int nbusy)
     }
 }
 
+#endif /* !HITZ_PLAYER_BUILD */
+
 /* RECOMP_ASPECT_4_3=1: keep the game's 4:3 shape whatever the window size. The swap chain
  * follows the window's client size (ResizeBuffers when it changes, polled every flip and on
  * WM_SIZE), and the game image is drawn, filtered, into the largest centred 4:3 rectangle, with
@@ -3329,7 +3380,15 @@ static void sampler_report(LONG from, LONG to, const ThreadCpu *busy, int nbusy)
 static int aspect_on(void)
 {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("RECOMP_ASPECT_4_3"); on = e && e[0] == '1'; }
+    if (on < 0) {
+        const char *e = getenv("RECOMP_ASPECT_4_3");
+#ifdef NHL_RELEASE
+        /* Stretch Off must preserve 4:3 even on a fresh installation. */
+        on = !e || e[0] == '1';
+#else
+        on = e && e[0] == '1';
+#endif
+    }
     return on;
 }
 
@@ -3339,7 +3398,15 @@ static int aspect_on(void)
 static int f11_on(void)
 {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("RECOMP_F11_FULLSCREEN"); on = e && e[0] == '1'; }
+    if (on < 0) {
+        const char *e = getenv("RECOMP_F11_FULLSCREEN");
+#ifdef NHL_RELEASE
+        /* Fullscreen is a player setting, not an opt-in development feature. */
+        on = !e || e[0] == '1';
+#else
+        on = e && e[0] == '1';
+#endif
+    }
     return on;
 }
 
@@ -3846,6 +3913,7 @@ static void be_flip(void)
     }
     gpu_time_end();
     frame_csv();
+#ifndef HITZ_PLAYER_BUILD
     {   /* RECOMP_FLIPTIME=<ms>: log every flip-to-flip interval longer than this, with the
          * draws and triangles it carried (diagnostic for stalls). */
         static int thr = -2; static LARGE_INTEGER pf, last; static uint32_t d_last, t_last; static uint64_t du_last, hu_last, eu_last, dn_last, un_last; static ThreadCpu cur[TS_MAX], prev[TS_MAX]; static int cur_n, prev_n; static LONG smp_mark; static uint32_t cn_last, cvn_last; static double cm_last, cvm_last;
@@ -3897,6 +3965,7 @@ static void be_flip(void)
             du_last = s_draw_us; hu_last = s_hash_us; eu_last = s_dec_us; dn_last = s_dec_n; un_last = s_up_n;
         }
     }
+#endif /* !HITZ_PLAYER_BUILD */
     for (i = 0; i < g.nrt; i++) g.rt[i].uses = 0;
     g.flips++;
     benchmark_plan_tick();

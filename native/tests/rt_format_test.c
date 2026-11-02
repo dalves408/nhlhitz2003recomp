@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "../src/nv2a_surface_formats.h"
+#include "../src/d3d11_device.h"
 
 static int sample(ID3D11Device *dev, ID3D11DeviceContext *ctx,
                   ID3D11ShaderResourceView *srv, const float want[4])
@@ -115,8 +116,30 @@ int main(void)
     const float sample565[4] = {66.0f/255,65.0f/255,198.0f/255,1};
     const float sample1555[4] = {66.0f/255,132.0f/255,198.0f/255,1};
     int failed;
-    HRESULT hr = D3D11CreateDevice(NULL,D3D_DRIVER_TYPE_HARDWARE,NULL,0,NULL,0,D3D11_SDK_VERSION,&dev,NULL,&ctx);
+    HitzGpuCandidate ordered[3] = {0};
+    HRESULT hr;
+    /* Old hybrid enumeration may put Intel first and lack WDDM hybrid flags. */
+    ordered[0].description.VendorId = 0x8086;
+    ordered[0].priority = hitz_gpu_priority(0x8086,64*1048576,0,0);
+    ordered[1].description.VendorId = 0x10de;
+    ordered[1].priority = hitz_gpu_priority(0x10de,1024ull*1048576,0,0);
+    ordered[2].description.VendorId = 0x1002;
+    ordered[2].priority = hitz_gpu_priority(0x1002,2048ull*1048576,0,1);
+    hitz_sort_gpus(ordered,3);
+    if (ordered[0].description.VendorId != 0x10de || ordered[2].priority != 0) return 1;
+    puts("PASS: legacy Intel-first / GTX 660M priority; integrated AMD classification");
+    hr = hitz_create_graphics_device(0,NULL,0,&dev,NULL,&ctx,stdout);
     if (FAILED(hr)) { printf("D3D11CreateDevice failed %08lX\n", (unsigned long)hr); return 1; }
+    {
+        IDXGIDevice *dxgi = NULL; IDXGIAdapter *adapter = NULL; DXGI_ADAPTER_DESC description;
+        if (FAILED(ID3D11Device_QueryInterface(dev,&IID_IDXGIDevice,(void **)&dxgi))) return 1;
+        hr = IDXGIDevice_GetAdapter(dxgi,&adapter); IDXGIDevice_Release(dxgi);
+        if (FAILED(hr)) return 1;
+        hr = IDXGIAdapter_GetDesc(adapter,&description); IDXGIAdapter_Release(adapter);
+        if (FAILED(hr)) return 1;
+        printf("Selected adapter: %ls (vendor %04X, device %04X)\n", description.Description,
+            description.VendorId, description.DeviceId);
+    }
     failed = check(dev,ctx,hitz_rt_dxgi_format(3),rgb565,(uint16_t)((8<<11)|(16<<5)|24),sample565);
     failed |= check(dev,ctx,hitz_rt_dxgi_format(2),argb1555,(uint16_t)(0x8000|(8<<10)|(16<<5)|24),sample1555);
     if (hitz_rt_dxgi_format(1) != DXGI_FORMAT_B5G5R5A1_UNORM ||

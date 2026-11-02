@@ -29,6 +29,8 @@ build/
 *.lib
 *.dmp
 *.bmp
+!native/installer/wizard_small_*.bmp
+/native/installer/Output/
 *.log
 shadercache/
 *.hsrc
@@ -52,3 +54,4 @@ __pycache__/
 .idea/
 Thumbs.db
 .DS_Store
+.codex-remote-attachments/

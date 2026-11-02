@@ -44,6 +44,7 @@ static void header_extra(void)
 {
     fprintf(stderr, "xbe         : NHL Hitz 2003 (USA) title 0x4D57000B, entry 0x001C5F4E, XDK 4531\n");
     fprintf(stderr, "renderer    : D3D11 (NV2A push-buffer executor)\n");
+    fprintf(stderr, "render GPU  : reported by [GPU] ACTUAL RENDER GPU after device creation; see debug/graphics.txt\n");
     print_recomp_env("env (user)  :");
 }
 

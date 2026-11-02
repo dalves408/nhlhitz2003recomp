@@ -5312,7 +5312,10 @@ static void bridge_NtDeviceIoControlFile(void)
         }
         size.QuadPart = 0;
         if (h && h != INVALID_HANDLE_VALUE)
-            GetFileSizeEx(h, &size);
+        {
+            extern BOOL hitz_disk_size(HANDLE, PLARGE_INTEGER);
+            if (!hitz_disk_size(h, &size)) GetFileSizeEx(h, &size);
+        }
         BRIDGE_MEM32(out_va +  0) = 0;                       /* StartingOffset */
         BRIDGE_MEM32(out_va +  4) = 0;
         BRIDGE_MEM32(out_va +  8) = (uint32_t)size.LowPart;  /* PartitionLength */

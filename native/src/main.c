@@ -38,6 +38,10 @@
 #include <string.h>
 #include <math.h>
 
+/* Driver-recognized hybrid-laptop GPU requests. These must be exports of the EXE. */
+__declspec(dllexport) DWORD NvOptimusEnablement = 1;
+__declspec(dllexport) DWORD AmdPowerXpressRequestHighPerformance = 1;
+
 /* xboxrecomp runtime headers */
 #include <xbox/xboxrecomp.h>
 
@@ -83,8 +87,47 @@ extern ptrdiff_t g_xbox_mem_offset;
  * Run: py -3 -m tools.xbe_parser game/default.xbe
  */
 #define YOUR_GAME_ENTRY_POINT   0x001C5F4E  /* XBE entry point VA */
+#ifdef NHL_RELEASE
+#define YOUR_GAME_XBE_PATH      "game_files\\default.xbe"
+#define YOUR_GAME_DIR           "game_files"
+static char s_player_save_dir[MAX_PATH];
+static int player_init(void)
+{
+    char exe[MAX_PATH],base[MAX_PATH],cache[MAX_PATH],*slash;
+    DWORD length;
+    LPCH inherited,entry;
+    /* Kept for process lifetime: Setup/uninstall must not remove open game files. */
+    if(!CreateMutexA(NULL,FALSE,"Local\\NHLHitz2003Player"))return 0;
+    length=GetModuleFileNameA(NULL,exe,sizeof exe);
+    if(!length||length>=sizeof exe||(slash=strrchr(exe,'\\'))==NULL)return 0;
+    *slash=0;if(!SetCurrentDirectoryA(exe))return 0;
+#ifndef XRDBG
+    freopen("NUL","w",stdout);freopen("NUL","w",stderr);
+    inherited=GetEnvironmentStringsA();
+    if(inherited){
+        for(entry=inherited;*entry;entry+=strlen(entry)+1)if(!strncmp(entry,"RECOMP_",7)){
+            char name[128];size_t length=strcspn(entry,"=");
+            if(length<sizeof name){memcpy(name,entry,length);name[length]=0;
+                SetEnvironmentVariableA(name,NULL);_putenv_s(name,"");}
+        }
+        FreeEnvironmentStringsA(inherited);
+    }
+#else
+    (void)inherited;(void)entry;
+#endif
+    length=GetEnvironmentVariableA("LOCALAPPDATA",base,sizeof base);
+    if(!length||length>MAX_PATH-64)return 0;
+    strcat(base,"\\NHLHitz2003");
+    if(!CreateDirectoryA(base,NULL)&&GetLastError()!=ERROR_ALREADY_EXISTS)return 0;
+    snprintf(s_player_save_dir,sizeof s_player_save_dir,"%s\\SaveData",base);
+    snprintf(cache,sizeof cache,"%s\\shadercache",base);
+    _putenv_s("RECOMP_D3D11_SHADERCACHE_DIR",cache);
+    return 1;
+}
+#else
 #define YOUR_GAME_XBE_PATH      "game\\default.xbe"
 #define YOUR_GAME_DIR            "game"
+#endif
 
 /* ── Forward declarations ──────────────────────────────────── */
 
@@ -129,6 +172,7 @@ extern void xbe_entry_point(void);
  *
  * Requires linking dbghelp and keeping the .pdb beside the .exe.
  */
+#ifndef HITZ_PLAYER_BUILD
 static void print_guest_context(void *rip)
 {
     /* SYMBOL_INFO is variable-length: the name is written past the struct, so
@@ -203,6 +247,8 @@ static void print_guest_context(void *rip)
     }
 }
 
+#endif /* !HITZ_PLAYER_BUILD */
+
 /* The emulated APU.
  *
  * Two entry points that had no callers anywhere in the tree. apu_mmio_hook.c
@@ -220,6 +266,7 @@ typedef struct MCPXAPUState MCPXAPUState;
 extern MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr);
 extern MCPXAPUState *g_apu_state;
 
+#ifndef HITZ_PLAYER_BUILD
 /* RECOMP_HANG_DUMP=<secs>: once, that long after start, print every thread's
  * host stack (symbolised from the PDB) and carry on. Meant for hangs where the
  * guest's own watchdog only sees the guest thread. */
@@ -286,6 +333,8 @@ static void dump_crash_guest_ram(void)
     fprintf(stderr, "[CRASH] guest RAM snapshot: %s\n", path);
 }
 
+#endif /* !HITZ_PLAYER_BUILD */
+
 static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
 {
     if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
@@ -301,6 +350,7 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
         if (xbox_VehMmioFault(ep))
             return EXCEPTION_CONTINUE_EXECUTION;
 
+#ifndef HITZ_PLAYER_BUILD
         fprintf(stderr, "[CRASH] Access violation at RIP=0x%llX, fault addr=0x%llX (%s)\n",
             (unsigned long long)ep->ContextRecord->Rip,
             (unsigned long long)fault_addr,
@@ -337,6 +387,7 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
             }
         }
         fflush(stderr);
+#endif
     }
 
     return EXCEPTION_CONTINUE_SEARCH;
@@ -371,13 +422,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     (void)lpCmdLine;
     (void)nCmdShow;
 
+#ifdef NHL_RELEASE
+    if(!player_init()){
+        MessageBoxA(NULL,"The game could not open its installation or your local data folder.","NHL Hitz 2003",MB_ICONERROR);
+        return 1;
+    }
+#endif
+
 #ifdef XRDBG
     /* Debug-kit build: first, before anything prints -- stdout and stderr go
      * to %LOCALAPPDATA%\NHLHitz2003\debug\session_*.log from here on. */
     hitz_debug_init();
 #endif
 
-#ifndef XRDBG
+#if !defined(XRDBG) && !defined(NHL_RELEASE)
     /* Unbuffered output for immediate visibility during debugging. The debug
      * kit sets up both streams itself (and has written to them already, after
      * which the CRT does not allow re-buffering). */
@@ -392,15 +450,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* Load symbols up front rather than from inside the handler: at fault
      * time the process is already in a bad way, and SymInitialize
      * allocates. Failure is not fatal -- the handler prints no name. */
+#ifndef HITZ_PLAYER_BUILD
     SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME);
     SymInitialize(GetCurrentProcess(), NULL, TRUE);
+#endif
     AddVectoredExceptionHandler(1, veh_handler);
+#ifndef HITZ_PLAYER_BUILD
     if (getenv("RECOMP_HANG_DUMP")) CreateThread(NULL, 0, hang_dump_thread, (LPVOID)(uintptr_t)atoi(getenv("RECOMP_HANG_DUMP")), 0, NULL);
+
+#endif
 
     /* Step 1: Load XBE */
     if (!load_xbe(YOUR_GAME_XBE_PATH, &xbe_data, &xbe_size)) {
         MessageBoxA(NULL, "Failed to load default.xbe.\n"
+#ifdef NHL_RELEASE
+                    "Run Setup to import your NHL Hitz 2003 USA disc image or game folder.",
+#else
                     "Place the game files in the 'game' subdirectory.",
+#endif
                     "Recomp", MB_ICONERROR);
         return 1;
     }
@@ -430,8 +497,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         if (!getenv("RECOMP_GFX_THREAD")) _putenv_s("RECOMP_GFX_THREAD", "0");
         _putenv_s("RECOMP_FB_WINDOW", "");
         if (!getenv("RECOMP_FLIP_PACING")) _putenv_s("RECOMP_FLIP_PACING", "0");
+#ifndef NHL_RELEASE
         if (!getenv("RECOMP_PRESENT_HZ")) _putenv_s("RECOMP_PRESENT_HZ", "0");
         if (!getenv("RECOMP_D3D11_VSYNC")) _putenv_s("RECOMP_D3D11_VSYNC", "0");
+#endif
         if (!getenv("RECOMP_D3D11_RC")) _putenv_s("RECOMP_D3D11_RC", "1");
         if (!getenv("RECOMP_D3D11_GPUVS")) _putenv_s("RECOMP_D3D11_GPUVS", "1");
         /* FFP math is verified against the CPU reference. Unsupported batches
@@ -507,7 +576,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* Step 4: Set game directory for file I/O path translation */
     {
         extern void xbox_path_init(const char *game_dir, const char *save_dir);
+#ifdef NHL_RELEASE
+        xbox_path_init(YOUR_GAME_DIR,s_player_save_dir);
+#else
         xbox_path_init(YOUR_GAME_DIR, "../runtime/SaveData");
+#endif
     }
 
     /* Step 5: Initialize kernel bridge (thunk table in Xbox memory) */
@@ -558,7 +631,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
      * Not optional boilerplate: without this call RECOMP_WATCHDOG_SECS is
      * silently inert, and the one diagnostic that tells a hang from slowness
      * does nothing while appearing to be set. */
+#ifndef HITZ_PLAYER_BUILD
     xbox_WatchdogStart();
+#endif
 
     /* Step 7: Call the recompiled entry point */
     printf("\nStarting game...\n");
