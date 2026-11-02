@@ -1,4 +1,4 @@
-# NHL Hitz 2003 — Static Recompilation for Windows
+# NHL Hitz 2003 — Static Recompilation for Windows and Linux
 
 A native Windows port of the original Xbox **NHL Hitz 2003 (USA)**. The game's x86 executable (`default.xbe`) is
 statically recompiled to C and runs on a Windows host runtime: D3D11 graphics, XAudio2 sound, XInput and keyboard.
@@ -8,7 +8,17 @@ Work in progress. A prebuilt installer is on the [releases page](https://github.
 **No game data is included.** You need your own legally owned copy of the game (Title ID `0x4D57000B`). The ISO, its
 extracted files, the XBE and the C generated from it are never committed.
 
-## Requirements
+## Native Linux development
+
+The Linux development player uses SDL2/OpenGL and reaches live Exhibition
+gameplay. On the current AMD A6-7310 / Radeon R4 host, the first optimized
+gameplay sample averages **9.62 FPS**; a full match and steady 60 FPS remain
+unvalidated. See [STATUS.md](STATUS.md) for the checkpoint and remaining work,
+and [docs/LINUX.md](docs/LINUX.md) for setup and verification. After dependencies,
+game extraction and source generation, `bash play.sh` builds and launches it.
+The Windows installer and settings instructions below are Windows-specific.
+
+## Windows requirements
 
 - Windows 10/11 x64, a D3D11 GPU
 - Visual Studio 2022 (or Build Tools) with the C++ workload

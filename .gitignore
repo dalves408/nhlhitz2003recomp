@@ -41,3 +41,9 @@ __pycache__/
 .idea/
 Thumbs.db
 .DS_Store
+
+# Local Linux environment and extraction tools
+.venv/
+tools/xiso/
+tools/xiso.zip
+.codex-remote-attachments/

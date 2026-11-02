@@ -27,6 +27,9 @@
 #  define OHCI_TRAP_WIN32 1
 #elif defined(__aarch64__)
 #  define OHCI_TRAP_POSIX_A64 1
+#elif defined(__linux__) && defined(__x86_64__)
+#  define OHCI_TRAP_POSIX_X64 1
+#  include "mmio_x64_posix.h"
 #endif
 
 /* The runtime maps guest memory at a fixed host offset. */
@@ -439,7 +442,9 @@ static int     g_ctrl_sent_[USB_GAMEPAD_MAX];
 static unsigned s_pad_mask;
 static int s_hotplug;
 extern void usb_gamepad_unplug(int pad);
+#ifdef _WIN32
 extern DWORD WINAPI XInputGetState(DWORD user, void *state);
+#endif
 
 /* Which pad an endpoint descriptor talks to: by its function address, and
  * address 0 -- the default address a device answers before SET_ADDRESS --
@@ -1164,7 +1169,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
                 last_poll = tnow;
                 want = 1u;
                 for (p = 1; p < 4u; p++)
-                    if (XInputGetState((DWORD)p, st) == 0)
+                    if (XInputGetState((DWORD)p, (void *)st) == 0)
                         want |= 1u << p;
                 if (test && atoi(test) > 0 && ((tnow / (DWORD)atoi(test)) & 1u))
                     want |= 2u;
@@ -1428,7 +1433,7 @@ void xbox_OhciInit(void)
         if ((unsigned)s_npads > s_ndp)
             s_ndp = (unsigned)s_npads;      /* a port for every pad */
     }
-#if !defined(OHCI_TRAP_WIN32) && !defined(OHCI_TRAP_POSIX_A64)
+#if !defined(OHCI_TRAP_WIN32) && !defined(OHCI_TRAP_POSIX_A64) && !defined(OHCI_TRAP_POSIX_X64)
     /* No decoder for this host's instructions, so a trapped access could not
      * be answered. Leave the aperture as plain memory -- the title then sees
      * no controller, exactly as with RECOMP_USB unset -- and say so. */
@@ -1504,7 +1509,7 @@ int xbox_OhciOwnsAddress(uint32_t xbox_va)
     return hc_for(xbox_va) != NULL;
 }
 
-#if defined(OHCI_TRAP_POSIX_A64) || defined(OHCI_TRAP_WIN32)
+#if defined(OHCI_TRAP_POSIX_A64) || defined(OHCI_TRAP_WIN32) || defined(OHCI_TRAP_POSIX_X64)
 /* Both decoders hand over 8-byte accesses whole (ldr/str x or a d register
  * on A64, a REX.W mov on x86-64); the registers are 32-bit, so an 8-byte
  * access is two of them. */
@@ -1528,7 +1533,12 @@ static void ohci_write_split(void *dev, uint32_t off, uint64_t val, int size)
 
 int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
 {
-#if defined(OHCI_TRAP_POSIX_A64)
+#if defined(OHCI_TRAP_POSIX_X64)
+    OhciController *hc = hc_for(xbox_va);
+    if (!hc) return 0;
+    return hitz_mmio_emulate((ucontext_t *)ctx, xbox_va-hc->base, hc,
+                            ohci_read_split, ohci_write_split);
+#elif defined(OHCI_TRAP_POSIX_A64)
     ucontext_t *uc = (ucontext_t *)ctx;
     OhciController *hc = hc_for(xbox_va);
     int ok;

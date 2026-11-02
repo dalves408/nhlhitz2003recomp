@@ -25,7 +25,11 @@
 #include <stddef.h>   /* ptrdiff_t */
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "platform/win32_compat.h"
+#endif
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 

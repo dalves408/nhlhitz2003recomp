@@ -11,6 +11,10 @@ cmake_minimum_required(VERSION 3.20)
 # ============================================================================
 
 project(nhl_hitz_2003_recomp C)
+if(UNIX AND NOT APPLE)
+    include(cmake/linux.cmake)
+    return()
+endif()
 option(NHL_RELEASE "Packaged player build with user-writable data paths and quiet output" OFF)
 option(HITZ_DEBUGKIT "Debug build with the xrdbg self-monitoring kit" OFF)
 set(HITZ_PACKAGE_VERSION "1.0.0" CACHE STRING "Installer and executable version")

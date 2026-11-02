@@ -5,7 +5,11 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#ifdef _MSC_VER
 __declspec(thread) uint32_t g_eax, g_ecx, g_esp;
+#else
+__thread uint32_t g_eax, g_ecx, g_esp;
+#endif
 ptrdiff_t g_xbox_mem_offset;
 extern void sub_00147AE0(void);
 #define M(p) (*(uint32_t *)(g_xbox_mem_offset+(uint32_t)(p)))

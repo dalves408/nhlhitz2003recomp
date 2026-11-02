@@ -27,6 +27,9 @@
 #if !defined(_WIN32)
 #include <unistd.h>   /* _exit */
 #endif
+#if defined(__linux__)
+#include "linux_guest_mapping.h"
+#endif
 
 /* XBE header field offsets (per xboxdevwiki.net/Xbe) */
 #define XBE_MAGIC_OFFSET        0x0000
@@ -278,6 +281,11 @@ static uint64_t ext_vma_span(uint64_t mirror_top)
  * the MapViewOfFileEx call it always was. */
 static void *layout_map_view(HANDLE mapping, size_t size, void *addr)
 {
+#if defined(__linux__)
+    uintptr_t a=(uintptr_t)addr,b=(uintptr_t)g_span_base;
+    if(g_span_whole_window&&a>=b&&size<=g_span_size&&a-b<=g_span_size-size)
+        return hitz_linux_map_guest(mapping,size,addr);
+#endif
 #if defined(_WIN32)
     if (win_in_window((uintptr_t)addr, size)) {
         win_split_placeholder((uintptr_t)addr, size);
@@ -296,6 +304,11 @@ static void *layout_map_view(HANDLE mapping, size_t size, void *addr)
  * documented to work. */
 static void *layout_commit_at(void *addr, size_t size)
 {
+#if defined(__linux__)
+    uintptr_t a=(uintptr_t)addr,b=(uintptr_t)g_span_base;
+    if(g_span_whole_window&&a>=b&&size<=g_span_size&&a-b<=g_span_size-size)
+        return hitz_linux_commit_guest(addr,size);
+#endif
 #if defined(_WIN32)
     if (win_in_window((uintptr_t)addr, size)) {
         win_split_placeholder((uintptr_t)addr, size);
@@ -656,8 +669,12 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-#if !defined(_WIN32) && defined(__aarch64__)
+#if !defined(_WIN32) && (defined(__aarch64__) || (defined(__linux__) && defined(__x86_64__)))
+#ifdef __aarch64__
 #include "platform/mmio_decode_a64.h"
+#else
+#include "mmio_x64_posix.h"
+#endif
 #include <sys/mman.h>
 static size_t g_ac97_hsize;    /* host page: 16 KB on arm64 Darwin */
 
@@ -705,8 +722,13 @@ int xbox_Ac97PosixFault(void *ucv, uintptr_t fault)
         __atomic_store_n(&g_ac97_posix_lock, 0, __ATOMIC_RELEASE);
         return 0;
     }
+#ifdef __aarch64__
     ok = mmio_emulate_a64((ucontext_t *)ucv, (uint32_t)(fault - (uintptr_t)g_ac97_page),
                           g_ac97_page, ac97_posix_rd, ac97_posix_wr);
+#else
+    ok = hitz_mmio_emulate((ucontext_t *)ucv, (uint32_t)(fault - (uintptr_t)g_ac97_page),
+                          g_ac97_page, ac97_posix_rd, ac97_posix_wr);
+#endif
     if (ok)
         ac97_clear_reset_bits();
     mprotect(g_ac97_page, g_ac97_hsize, PROT_READ);
@@ -724,7 +746,7 @@ static void ac97_arm_write_trap(void)
 
     if (!g_mcpx_memory || g_ac97_page)
         return;
-#if !defined(_WIN32) && !defined(__aarch64__)
+#if !defined(_WIN32) && !defined(__aarch64__) && !(defined(__linux__) && defined(__x86_64__))
     /* No POSIX decoder for this host's stores: a trapped write would be a
      * fault nothing services. Leave the page writable. */
     (void)old;
@@ -733,7 +755,7 @@ static void ac97_arm_write_trap(void)
     return;
 #endif
     g_ac97_page = (char *)g_mcpx_memory + AC97_NABM_OFFSET;
-#if !defined(_WIN32) && defined(__aarch64__)
+#if !defined(_WIN32) && (defined(__aarch64__) || (defined(__linux__) && defined(__x86_64__)))
     (void)old;
     g_ac97_hsize = (size_t)sysconf(_SC_PAGESIZE);
     if (g_ac97_hsize < AC97_TRAP_BYTES)
@@ -831,7 +853,7 @@ int xbox_VehMmioFault(void *exception_pointers)
     return 0;
 }
 #else
-#if defined(__aarch64__)
+#if defined(__aarch64__) || (defined(__linux__) && defined(__x86_64__))
 extern bool apu_hook_handle_mmio_posix(void *ucv, uintptr_t fault_addr,
                                        uint32_t fault_xbox_va, int is_write);
 #endif
@@ -843,7 +865,7 @@ extern bool apu_hook_handle_mmio_posix(void *ucv, uintptr_t fault_addr,
  * 0. */
 int xbox_PosixMmioFault(void *ucv, uintptr_t fault)
 {
-#if defined(__aarch64__)
+#if defined(__aarch64__) || (defined(__linux__) && defined(__x86_64__))
     uint32_t va;
 
     if (!mmio_fault_va(fault, &va))
@@ -1658,7 +1680,15 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 
         if(s_ack_yield_every<=1 || ++yield_passes>=(unsigned)s_ack_yield_every){
             yield_passes=0;Sleep(0);
-        } else YieldProcessor();
+        } else {
+#if defined(_WIN32)
+            YieldProcessor();
+#elif defined(__x86_64__)
+            __asm__ __volatile__("pause");
+#else
+            __asm__ __volatile__("yield");
+#endif
+        }
     }
     return 0;
 }
@@ -2651,20 +2681,33 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             g_span_size = (size_t)1 << 32;
             g_span_whole_window = 1;
         }
+#if defined(__linux__)
+        /* Top-down mmap can put libraries immediately above a RAM-only span.
+         * Hold every guest aperture first, without committing physical RAM. */
+        g_span_size=(size_t)1<<32;g_span_whole_window=1;
+        g_span_base=hitz_linux_reserve_guest(g_span_size);
+#else
         g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
+#endif
         if (g_span_base) {
-            VirtualFree(g_span_base, g_memory_size, MEM_RELEASE);
-            g_memory_base = MapViewOfFileEx(g_mapping_handle,
-                                            FILE_MAP_ALL_ACCESS, 0, 0,
-                                            g_memory_size, g_span_base);
+            if(!g_span_whole_window)VirtualFree(g_span_base, g_memory_size, MEM_RELEASE);
+            g_memory_base = layout_map_view(g_mapping_handle,g_memory_size,g_span_base);
             if (!g_memory_base) {
+#if defined(__linux__)
+                hitz_linux_release_guest();
+#else
                 VirtualFree(g_span_base, g_span_size, MEM_RELEASE);
+#endif
                 g_span_base = NULL;
                 g_span_size = 0;
                 g_span_whole_window = 0;
             }
         } else {
             g_span_whole_window = 0;
+#if defined(__linux__)
+            fprintf(stderr,"xbox_MemoryLayoutInit: cannot reserve the Linux guest window\n");
+            CloseHandle(g_mapping_handle);g_mapping_handle=NULL;return FALSE;
+#endif
         }
 #endif
 
@@ -3735,7 +3778,11 @@ void xbox_MemoryLayoutShutdown(void)
     /* Whatever is left of the base+mirrors reservation. The views carved out
      * of it are already unmapped above; this releases the range itself. */
     if (g_span_base) {
+#if defined(__linux__)
+        hitz_linux_release_guest();
+#else
         VirtualFree(g_span_base, g_span_size, MEM_RELEASE);
+#endif
         g_span_base = NULL;
         g_span_size = 0;
         g_span_whole_window = 0;
