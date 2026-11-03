@@ -1747,6 +1747,7 @@ typedef struct {
     uint32_t last_use;
     uint8_t mips;                    /* made with a mip chain (anisotropic filtering on) */
     uint8_t repl;                    /* the GPU texture is a replacement-pack image (a different size) */
+    int pack_wait;                   /* 1 + pack image index still decoding for this content, else 0 */
 } TexEntry;
 
 static TexEntry s_tex[MAX_TEX];
@@ -1884,8 +1885,6 @@ static int td_match(const char *list, uint32_t off)
 typedef struct { uint64_t hash; uint8_t cat; char path[MAX_PATH]; } PackFile;   /* cat: 0 rink, 1 logos, 2 jerseys, 3 glow, 4 other */
 static PackFile *s_pack;
 static int s_npack, s_pack_init;
-static uint32_t *s_pack_px;
-static size_t s_pack_cap;
 
 static void pack_scan(const char *dir, int depth, int cat)
 {
@@ -1913,7 +1912,8 @@ static void pack_scan(const char *dir, int depth, int cat)
             }
             continue;
         }
-        if (n > 20 && (!_stricmp(fd.cFileName + n - 4, ".png") || !_stricmp(fd.cFileName + n - 4, ".bmp"))) {
+        if (n > 20 && (!_stricmp(fd.cFileName + n - 4, ".png") || !_stricmp(fd.cFileName + n - 4, ".bmp")
+                       || !_stricmp(fd.cFileName + n - 4, ".dds"))) {
             char hx[17];
             int i, ok = 1, dup = 0;
             uint64_t v;
@@ -1922,7 +1922,12 @@ static void pack_scan(const char *dir, int depth, int cat)
             if (!ok) continue;
             v = _strtoui64(hx, NULL, 16);
             for (i = 0; i < s_npack; i++) if (s_pack[i].hash == v) { dup = 1; break; }
-            if (dup) continue;
+            if (dup) {   /* a ready-made .dds beats a .png/.bmp of the same image: no decode, mips included */
+                size_t m = strlen(s_pack[i].path);
+                if (!_stricmp(fd.cFileName + n - 4, ".dds") && (m < 4 || _stricmp(s_pack[i].path + m - 4, ".dds")))
+                    snprintf(s_pack[i].path, MAX_PATH, "%s", full);
+                continue;
+            }
             if ((s_npack & 255) == 0) s_pack = (PackFile *)realloc(s_pack, sizeof(PackFile) * (size_t)(s_npack + 256));
             if (!s_pack) { s_npack = 0; break; }
             s_pack[s_npack].hash = v;
@@ -1934,39 +1939,119 @@ static void pack_scan(const char *dir, int depth, int cat)
     FindClose(h);
 }
 
-/* Decode a PNG/BMP file to 32-bit BGRA with Windows Imaging Component; returns pixels in s_pack_px. */
-static const uint32_t *pack_load(const char *path, uint32_t *w, uint32_t *hh)
+/* Decode a PNG/BMP file to 32-bit BGRA with Windows Imaging Component, into a malloc'd buffer the caller
+ * frees. Each thread passes its own factory (decoder workers have one each; the render thread's is made on
+ * its first synchronous load). */
+static uint32_t *pack_decode(IWICImagingFactory *fac, const char *path, uint32_t *w, uint32_t *hh)
 {
-    IWICImagingFactory *fac = NULL;
     IWICBitmapDecoder *dec = NULL;
     IWICBitmapFrameDecode *fr = NULL;
     IWICFormatConverter *cv = NULL;
     WCHAR wp[MAX_PATH];
     UINT W = 0, H = 0;
-    const uint32_t *ret = NULL;
+    uint32_t *px = NULL;
 
-    CoInitializeEx(NULL, COINIT_MULTITHREADED);
     MultiByteToWideChar(CP_ACP, 0, path, -1, wp, MAX_PATH);
-    if (FAILED(CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, &IID_IWICImagingFactory, (void **)&fac))) return NULL;
     if (FAILED(IWICImagingFactory_CreateDecoderFromFilename(fac, wp, NULL, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec))) goto out;
     if (FAILED(IWICBitmapDecoder_GetFrame(dec, 0, &fr))) goto out;
     if (FAILED(IWICBitmapFrameDecode_GetSize(fr, &W, &H)) || !W || !H || W > 16384 || H > 16384) goto out;
     if (FAILED(IWICImagingFactory_CreateFormatConverter(fac, &cv))) goto out;
     if (FAILED(IWICFormatConverter_Initialize(cv, (IWICBitmapSource *)fr, &GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, NULL, 0.0, WICBitmapPaletteTypeCustom))) goto out;
-    if ((size_t)W * H > s_pack_cap) {
-        free(s_pack_px);
-        s_pack_px = (uint32_t *)malloc((size_t)W * H * 4);
-        s_pack_cap = s_pack_px ? (size_t)W * H : 0;
-        if (!s_pack_px) goto out;
-    }
-    if (FAILED(IWICFormatConverter_CopyPixels(cv, NULL, W * 4, W * H * 4, (BYTE *)s_pack_px))) goto out;
-    *w = W; *hh = H; ret = s_pack_px;
+    px = (uint32_t *)malloc((size_t)W * H * 4);
+    if (!px) goto out;
+    if (FAILED(IWICFormatConverter_CopyPixels(cv, NULL, W * 4, W * H * 4, (BYTE *)px))) { free(px); px = NULL; goto out; }
+    *w = W; *hh = H;
 out:
     if (cv) IWICFormatConverter_Release(cv);
     if (fr) IWICBitmapFrameDecode_Release(fr);
     if (dec) IWICBitmapDecoder_Release(dec);
-    IWICImagingFactory_Release(fac);
-    return ret;
+    return px;
+}
+
+static IWICImagingFactory *pack_factory(void)
+{
+    IWICImagingFactory *fac = NULL;
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (FAILED(CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, &IID_IWICImagingFactory, (void **)&fac))) return NULL;
+    return fac;
+}
+
+/* A pack image ready for the GPU: decoded BGRA pixels (one level; the mips are made on the GPU), or a
+ * .dds file's levels as stored (mips included, any format below). buf is malloc'd; data points into it. */
+typedef struct { void *buf; const uint8_t *data; size_t size; uint32_t w, h, mips; DXGI_FORMAT fmt; } PackImg;
+
+/* Bytes per 4x4 block for block-compressed formats, 0 for the 32-bit uncompressed ones, -1 unsupported. */
+static int dds_block_bytes(DXGI_FORMAT f)
+{
+    switch (f) {
+    case DXGI_FORMAT_BC1_UNORM: return 8;
+    case DXGI_FORMAT_BC2_UNORM: case DXGI_FORMAT_BC3_UNORM: case DXGI_FORMAT_BC7_UNORM: return 16;
+    case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM: return 0;
+    default: return -1;
+    }
+}
+
+static size_t dds_level(DXGI_FORMAT f, uint32_t w, uint32_t h, UINT *pitch)
+{
+    int bb = dds_block_bytes(f);
+    if (bb > 0) {
+        *pitch = ((w + 3) / 4) * (UINT)bb;
+        return (size_t)*pitch * ((h + 3) / 4);
+    }
+    *pitch = w * 4;
+    return (size_t)*pitch * h;
+}
+
+static uint32_t rd32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
+
+static int pack_read_dds(const char *path, PackImg *im)
+{
+    FILE *f = fopen(path, "rb");
+    uint8_t *b;
+    long n;
+    size_t off = 128, need = 0;
+    uint32_t fourcc, l, w, h;
+    memset(im, 0, sizeof *im);
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END); n = ftell(f); fseek(f, 0, SEEK_SET);
+    b = n > 148 ? (uint8_t *)malloc((size_t)n) : NULL;
+    if (!b || fread(b, 1, (size_t)n, f) != (size_t)n || memcmp(b, "DDS ", 4) || rd32(b + 4) != 124) { fclose(f); free(b); return 0; }
+    fclose(f);
+    im->h = rd32(b + 12); im->w = rd32(b + 16); im->mips = rd32(b + 28) ? rd32(b + 28) : 1;
+    fourcc = rd32(b + 84);
+    if (fourcc == MAKEFOURCC('D', 'X', '1', '0')) {
+        im->fmt = (DXGI_FORMAT)rd32(b + 128);
+        if (rd32(b + 132) != 3 /* TEXTURE2D */ || rd32(b + 140) > 1 || (rd32(b + 136) & 4) /* cube */) { free(b); return 0; }
+        off = 148;
+    } else if (fourcc == MAKEFOURCC('D', 'X', 'T', '1')) im->fmt = DXGI_FORMAT_BC1_UNORM;
+    else if (fourcc == MAKEFOURCC('D', 'X', 'T', '3')) im->fmt = DXGI_FORMAT_BC2_UNORM;
+    else if (fourcc == MAKEFOURCC('D', 'X', 'T', '5')) im->fmt = DXGI_FORMAT_BC3_UNORM;
+    else if ((rd32(b + 80) & 0x40) && rd32(b + 88) == 32)           /* DDPF_RGB, 32 bits */
+        im->fmt = rd32(b + 100) == 0xFF ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
+    else { free(b); return 0; }
+    if (dds_block_bytes(im->fmt) < 0 || !im->w || !im->h || im->w > 16384 || im->h > 16384 || im->mips > 15) { free(b); return 0; }
+    for (l = 0, w = im->w, h = im->h; l < im->mips; l++) {
+        UINT pitch;
+        need += dds_level(im->fmt, w, h, &pitch);
+        w = w > 1 ? w / 2 : 1; h = h > 1 ? h / 2 : 1;
+    }
+    if (off + need > (size_t)n) { free(b); return 0; }
+    im->buf = b; im->data = b + off; im->size = need;
+    return 1;
+}
+
+/* Read a pack image: a .dds as stored, anything else decoded by WIC. */
+static int pack_read(IWICImagingFactory *fac, const char *path, PackImg *im)
+{
+    size_t m = strlen(path);
+    if (m > 4 && !_stricmp(path + m - 4, ".dds")) return pack_read_dds(path, im);
+    memset(im, 0, sizeof *im);
+    if (!fac) return 0;
+    im->buf = pack_decode(fac, path, &im->w, &im->h);
+    if (!im->buf) return 0;
+    im->data = (const uint8_t *)im->buf; im->mips = 1; im->fmt = DXGI_FORMAT_B8G8R8A8_UNORM;
+    im->size = (size_t)im->w * im->h * 4;
+    return 1;
 }
 
 static void pack_init(void)
@@ -1999,20 +2084,299 @@ static int pack_installed(void)
     return s_npack > 0;
 }
 
-static const uint32_t *pack_lookup(uint64_t hash, uint32_t *w, uint32_t *hh)
+/* Pack lookup by content hash: an open-addressing table over s_pack, built once after the scan. */
+static int *s_pack_map;
+static uint32_t s_pack_map_mask;
+
+static void pack_map_build(void)
 {
-    int i;
+    uint32_t n = 16, i;
+    while (n < (uint32_t)s_npack * 2) n <<= 1;
+    s_pack_map = (int *)malloc(sizeof(int) * n);
+    if (!s_pack_map) return;
+    for (i = 0; i < n; i++) s_pack_map[i] = -1;
+    s_pack_map_mask = n - 1;
+    for (i = 0; i < (uint32_t)s_npack; i++) {
+        uint32_t k = (uint32_t)(s_pack[i].hash ^ (s_pack[i].hash >> 29)) & s_pack_map_mask;
+        while (s_pack_map[k] >= 0) k = (k + 1) & s_pack_map_mask;
+        s_pack_map[k] = (int)i;
+    }
+}
+
+/* Index of the pack image for this content hash, or -1 (no image, hi-res off, scale below 2x, or its
+ * category switched off). */
+static int pack_find(uint64_t hash)
+{
+    uint32_t k;
     pack_init();
-    if (!hash || !s_npack || !s_hires || s_scale < 2) return NULL;     /* the 4x pictures need Render Scale 2x or more */
-    for (i = 0; i < s_npack; i++)
-        if (s_pack[i].hash == hash) {
-            const uint32_t *r;
-            if (!s_cat_on[s_pack[i].cat]) return NULL;
-            r = pack_load(s_pack[i].path, w, hh);
-            if (r) s_pack_hits[s_pack[i].cat]++;
-            return r;
+    if (!hash || !s_npack || !s_hires || s_scale < 2) return -1;      /* the 4x pictures need Render Scale 2x or more */
+    if (!s_pack_map) {
+        pack_map_build();
+        if (!s_pack_map) return -1;
+    }
+    for (k = (uint32_t)(hash ^ (hash >> 29)) & s_pack_map_mask; s_pack_map[k] >= 0; k = (k + 1) & s_pack_map_mask)
+        if (s_pack[s_pack_map[k]].hash == hash)
+            return s_cat_on[s_pack[s_pack_map[k]].cat] ? s_pack_map[k] : -1;
+    return -1;
+}
+
+/* GPU textures made from pack images, kept per pack image. Titles rewrite the same guest texture with a
+ * handful of images over and over (and evict and reload others), so without this every change paid a PNG
+ * decode, a texture creation and a mip build on the render thread: ~75 ms each at 4x. Cache entries hold
+ * their own reference; texture-cache entries that use one take another, so evicting here never frees a
+ * texture still bound. Bounded by RECOMP_PACK_CACHE_MB (default 1536 MB, estimated with mips);
+ * RECOMP_PACK_CACHE=0 restores loading on every use (synchronous, as before).
+ *
+ * Decoding runs on worker threads (RECOMP_PACK_ASYNC=0 decodes on the render thread instead). A texture
+ * whose pack image is not decoded yet is drawn from the game's own pixels; pack_pump() at each flip makes
+ * the GPU textures for finished images, and the waiting texture-cache entries switch to them on their next
+ * use. The guest texture itself is never touched or waited for. */
+typedef struct { ID3D11Texture2D *tex; ID3D11ShaderResourceView *srv; uint64_t bytes; uint32_t last_use; } PackGpu;
+static PackGpu *s_pack_gpu;
+static uint64_t s_pack_gpu_bytes, s_pack_gpu_budget;
+static int s_pack_cache_on = -1, s_pack_async;
+static uint64_t s_pack_load_n, s_pack_load_us, s_pack_create_us, s_pack_hit_n;
+
+/* Decode jobs. s_pack_st[i]: 0 idle, 1 queued or decoding, 2 decoded (image waiting in s_pack_job[i]),
+ * 3 unreadable. Workers write the pixels, then publish state 2 with an interlocked store. */
+#define PACK_QUEUE 256
+static volatile LONG *s_pack_st;
+static PackImg *s_pack_job;
+static uint32_t *s_pack_job_us;
+static PackGpu *s_pack_job_gpu;                 /* textures a worker already made (.dds images) */
+static int s_pack_q[PACK_QUEUE], s_pack_qhead, s_pack_qtail;
+static CRITICAL_SECTION s_pack_qlock;
+static CONDITION_VARIABLE s_pack_qcv;
+static IWICImagingFactory *s_pack_fac;          /* the render thread's, for synchronous loads */
+
+static DWORD WINAPI pack_worker(LPVOID unused)
+{
+    IWICImagingFactory *fac = pack_factory();
+    (void)unused;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    for (;;) {
+        int i, ok;
+        uint64_t t0;
+        EnterCriticalSection(&s_pack_qlock);
+        while (s_pack_qhead == s_pack_qtail) SleepConditionVariableCS(&s_pack_qcv, &s_pack_qlock, INFINITE);
+        i = s_pack_q[s_pack_qhead];
+        s_pack_qhead = (s_pack_qhead + 1) % PACK_QUEUE;
+        LeaveCriticalSection(&s_pack_qlock);
+        t0 = qpc_us();
+        ok = pack_read(fac, s_pack[i].path, &s_pack_job[i]);
+        if (ok && !(s_pack_job[i].fmt == DXGI_FORMAT_B8G8R8A8_UNORM && s_pack_job[i].mips == 1)) {
+            ok = pack_gpu_make(i, &s_pack_job[i], &s_pack_job_gpu[i]);
+            free(s_pack_job[i].buf);
+            memset(&s_pack_job[i], 0, sizeof s_pack_job[i]);
         }
-    return NULL;
+        s_pack_job_us[i] = (uint32_t)(qpc_us() - t0);
+        InterlockedExchange(&s_pack_st[i], ok ? 2 : 3);
+    }
+}
+
+static void pack_cache_setup(void)
+{
+    const char *e = getenv("RECOMP_PACK_CACHE"), *mb = getenv("RECOMP_PACK_CACHE_MB"), *as = getenv("RECOMP_PACK_ASYNC");
+    if (s_pack_cache_on >= 0) return;
+    s_pack_cache_on = !(e && *e == '0');
+    s_pack_gpu_budget = (uint64_t)(mb && atoi(mb) > 0 ? atoi(mb) : 1536) << 20;
+    if (s_pack_cache_on) s_pack_gpu = (PackGpu *)calloc((size_t)s_npack, sizeof(PackGpu));
+    if (!s_pack_gpu) s_pack_cache_on = 0;
+    s_pack_async = s_pack_cache_on && !(as && *as == '0');
+    if (s_pack_async) {
+        SYSTEM_INFO si;
+        int k, n;
+        s_pack_st = (volatile LONG *)calloc((size_t)s_npack, sizeof(LONG));
+        s_pack_job = (PackImg *)calloc((size_t)s_npack, sizeof(PackImg));
+        s_pack_job_us = (uint32_t *)calloc((size_t)s_npack, sizeof(uint32_t));
+        s_pack_job_gpu = (PackGpu *)calloc((size_t)s_npack, sizeof(PackGpu));
+        if (!s_pack_st || !s_pack_job || !s_pack_job_us || !s_pack_job_gpu) { s_pack_async = 0; return; }
+        InitializeCriticalSection(&s_pack_qlock);
+        InitializeConditionVariable(&s_pack_qcv);
+        GetSystemInfo(&si);
+        n = (int)si.dwNumberOfProcessors / 4;          /* a few: the guest and GPU threads need their cores */
+        if (n < 1) n = 1;
+        if (n > 3) n = 3;
+        for (k = 0; k < n; k++) CloseHandle(CreateThread(NULL, 0, pack_worker, NULL, 0, NULL));
+        logf_("texture pack: cache %u MB, %d decoder thread(s)\n", (unsigned)(s_pack_gpu_budget >> 20), n);
+    }
+}
+
+static void pack_gpu_release(PackGpu *p)
+{
+    if (p->srv) ID3D11ShaderResourceView_Release(p->srv);
+    if (p->tex) ID3D11Texture2D_Release(p->tex);
+    s_pack_gpu_bytes -= p->bytes;
+    memset(p, 0, sizeof *p);
+}
+
+static void pack_gpu_trim(void)
+{
+    while (s_pack_gpu_bytes > s_pack_gpu_budget) {
+        int i, w = -1;
+        for (i = 0; i < s_npack; i++)
+            if (s_pack_gpu[i].srv && s_pack_gpu[i].last_use != g.flips && (w < 0 || s_pack_gpu[i].last_use < s_pack_gpu[w].last_use)) w = i;
+        if (w < 0) break;                              /* everything left is in use this frame */
+        pack_gpu_release(&s_pack_gpu[w]);
+        if (s_pack_async) InterlockedExchange(&s_pack_st[w], 0);   /* decoded again if it comes back */
+    }
+}
+
+/* Make the GPU texture (with its mip chain) for pack image i. Decoded pixels get their mips built on the
+ * GPU (render thread only: it uses the immediate context); a .dds brings its own levels and is created as
+ * an immutable texture in one device call, which the decoder workers do themselves (the device is
+ * free-threaded: it is not created with D3D11_CREATE_DEVICE_SINGLETHREADED). */
+static int pack_gpu_make(int i, const PackImg *im, PackGpu *p)
+{
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_SUBRESOURCE_DATA sd[15];
+    HRESULT hr;
+    int gen = im->fmt == DXGI_FORMAT_B8G8R8A8_UNORM && im->mips == 1;
+    memset(p, 0, sizeof *p);
+    if (!im->data || im->w < 4 || im->h < 4) return 0;
+    memset(&td, 0, sizeof td);
+    td.Width = im->w; td.Height = im->h; td.ArraySize = 1;
+    td.Format = im->fmt;
+    td.SampleDesc.Count = 1;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    if (gen) {
+        td.MipLevels = 0;                                          /* the full chain */
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags |= D3D11_BIND_RENDER_TARGET;                  /* GenerateMips needs it */
+        td.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+        hr = ID3D11Device_CreateTexture2D(g.dev, &td, NULL, &p->tex);
+        if (SUCCEEDED(hr)) batch_update(g.ctx, (ID3D11Resource *)p->tex, 0, NULL, im->data, im->w * 4, 0);
+    } else {
+        const uint8_t *d = im->data;
+        uint32_t l, w = im->w, h = im->h;
+        td.MipLevels = im->mips;
+        td.Usage = D3D11_USAGE_IMMUTABLE;
+        for (l = 0; l < im->mips; l++) {
+            UINT pitch;
+            size_t sz = dds_level(im->fmt, w, h, &pitch);
+            sd[l].pSysMem = d; sd[l].SysMemPitch = pitch; sd[l].SysMemSlicePitch = (UINT)sz;
+            d += sz;
+            w = w > 1 ? w / 2 : 1; h = h > 1 ? h / 2 : 1;
+        }
+        hr = ID3D11Device_CreateTexture2D(g.dev, &td, sd, &p->tex);
+    }
+    if (SUCCEEDED(hr))
+        hr = ID3D11Device_CreateShaderResourceView(g.dev, (ID3D11Resource *)p->tex, NULL, &p->srv);
+    if (FAILED(hr)) {
+        logf_("pack texture %ux%u fmt %d failed 0x%08lX (%s)\n", im->w, im->h, (int)im->fmt, (unsigned long)hr, s_pack[i].path);
+        if (p->tex) ID3D11Texture2D_Release(p->tex);
+        memset(p, 0, sizeof *p);
+        return 0;
+    }
+    if (gen) batch_mips(g.ctx, p->srv);
+    p->bytes = gen ? (uint64_t)im->w * im->h * 4 * 4 / 3 : (uint64_t)im->size;
+    p->last_use = g.flips;
+    return 1;
+}
+
+/* Once per flip: turn decoded images into cached GPU textures (a few ms at most per frame). */
+static void pack_pump(void)
+{
+    static int next;
+    int k, made = 0;
+    uint64_t t0;
+    if (!s_pack_async) return;
+    t0 = qpc_us();
+    for (k = 0; k < s_npack && made < 16; k++) {
+        int i = (next + k) % s_npack;
+        if (s_pack_st[i] != 2) continue;
+        s_pack_load_n++;
+        s_pack_load_us += s_pack_job_us[i];
+        if (s_pack_job_gpu[i].srv) {                   /* made by the worker */
+            s_pack_gpu[i] = s_pack_job_gpu[i];
+            memset(&s_pack_job_gpu[i], 0, sizeof s_pack_job_gpu[i]);
+        } else {
+            uint64_t c0 = qpc_us();
+            if (!pack_gpu_make(i, &s_pack_job[i], &s_pack_gpu[i])) memset(&s_pack_gpu[i], 0, sizeof s_pack_gpu[i]);
+            s_pack_create_us += qpc_us() - c0;
+        }
+        if (s_pack_gpu[i].srv) {
+            s_pack_gpu[i].last_use = g.flips;
+            s_pack_gpu_bytes += s_pack_gpu[i].bytes;
+            s_pack_hits[s_pack[i].cat]++;
+            s_pack_st[i] = 1;                          /* in the cache; trimming sets it back to 0 */
+        } else s_pack_st[i] = 3;
+        free(s_pack_job[i].buf);
+        memset(&s_pack_job[i], 0, sizeof s_pack_job[i]);
+        made++;
+        if (qpc_us() - t0 > 4000) { k++; break; }
+    }
+    next = (next + k) % (s_npack ? s_npack : 1);
+    if (made) pack_gpu_trim();
+}
+
+/* The GPU texture for pack image i. With the cache, NULL means not ready yet (its decode is queued) or
+ * unreadable; the cache owns the result. With the cache off it is loaded now and *owned is set. */
+static PackGpu *pack_gpu_get(int i, PackGpu *tmp, int *owned)
+{
+    PackGpu *p;
+    PackImg im;
+    int ok;
+    uint64_t t0;
+
+    pack_cache_setup();
+    *owned = !s_pack_cache_on;
+    p = s_pack_cache_on ? &s_pack_gpu[i] : tmp;
+    if (s_pack_cache_on && p->srv) {
+        s_pack_hit_n++;
+        p->last_use = g.flips;
+        return p;
+    }
+    if (s_pack_async) {
+        if (InterlockedCompareExchange(&s_pack_st[i], 1, 0) == 0) {
+            EnterCriticalSection(&s_pack_qlock);
+            if ((s_pack_qtail + 1) % PACK_QUEUE == s_pack_qhead) s_pack_st[i] = 0;   /* full: asked again on a later use */
+            else {
+                s_pack_q[s_pack_qtail] = i;
+                s_pack_qtail = (s_pack_qtail + 1) % PACK_QUEUE;
+                WakeConditionVariable(&s_pack_qcv);
+            }
+            LeaveCriticalSection(&s_pack_qlock);
+        }
+        return NULL;
+    }
+    if (!s_pack_fac) s_pack_fac = pack_factory();
+    t0 = qpc_us();
+    ok = pack_read(s_pack_fac, s_pack[i].path, &im);
+    s_pack_load_us += qpc_us() - t0;
+    s_pack_load_n++;
+    if (!ok) return NULL;
+    t0 = qpc_us();
+    ok = pack_gpu_make(i, &im, p);
+    s_pack_create_us += qpc_us() - t0;
+    if (ok) s_pack_hits[s_pack[i].cat]++;
+    free(im.buf);
+    if (!ok) return NULL;
+    if (s_pack_cache_on) {
+        s_pack_gpu_bytes += p->bytes;
+        pack_gpu_trim();
+    }
+    return p;
+}
+
+/* A texture-cache entry drawn from the game's pixels while its pack image decoded: switch to the pack
+ * texture once the cache has it. */
+static void pack_try_swap(TexEntry *e)
+{
+    int i = e->pack_wait - 1;
+    PackGpu *p;
+    if (!s_pack_gpu || !s_pack_gpu[i].srv) {
+        if (s_pack_async && s_pack_st[i] == 3) e->pack_wait = 0;   /* unreadable: keep the original */
+        return;
+    }
+    p = &s_pack_gpu[i];
+    if (e->srv) ID3D11ShaderResourceView_Release(e->srv);
+    if (e->tex) ID3D11Texture2D_Release(e->tex);
+    e->tex = p->tex; e->srv = p->srv;
+    ID3D11Texture2D_AddRef(e->tex); ID3D11ShaderResourceView_AddRef(e->srv);
+    e->mips = 1; e->repl = 1; e->pack_wait = 0;
+    p->last_use = g.flips;
+    s_pack_hit_n++;
 }
 
 static TexEntry *get_texture(const Nv2aTexture *t)
@@ -2025,14 +2389,15 @@ static TexEntry *get_texture(const Nv2aTexture *t)
     }
     uint64_t h = 0, t0, ph = 0;
     size_t span, need;
-    const uint32_t *rp;
-    uint32_t rw_ = 0, rh_ = 0;
-    int remake = 0;
+    int pi, pg_owned = 0, remake = 0;
+    PackGpu *pg, pg_tmp;
+    uint64_t pg_loads;
 
     if (!t->width || !t->height || t->width > 4096 || t->height > 4096) return NULL;
     for (i = 0; i < s_ntex; i++)
         if (s_tex[i].off == t->offset && s_tex[i].color == t->color && s_tex[i].w == t->width
             && s_tex[i].h == t->height && s_tex[i].pitch == t->pitch) { e = &s_tex[i]; break; }
+    if (e && e->pack_wait) pack_try_swap(e);
     /* Hash once per presented frame unless RECOMP_D3D11_HASH_EVERY_USE=1: titles
      * rewrite textures between frames, rarely between two draws of one frame. */
     if (e && !g.hash_every_use && e->hash_flip == g.flips && e->srv) { e->last_use = g.flips; return e; }
@@ -2153,21 +2518,31 @@ static TexEntry *get_texture(const Nv2aTexture *t)
         }
     }
 
-    rp = pack_lookup(ph, &rw_, &rh_);
+    pi = pack_find(ph);
+    pg_loads = s_pack_load_n;
+    pg = pi >= 0 ? pack_gpu_get(pi, &pg_tmp, &pg_owned) : NULL;
+    {   /* RECOMP_PACK_LOG=1: one line per guest texture given a pack image (which guest textures keep changing) */
+        static int pl = -1;
+        if (pl < 0) pl = getenv("RECOMP_PACK_LOG") && *getenv("RECOMP_PACK_LOG") != '0';
+        if (pl && pi >= 0)
+            fprintf(stderr, "[PACK] flip %u off 0x%08X fmt 0x%X %ux%u hash %016llX -> #%d %s %s\n", g.flips, t->offset,
+                    t->color, t->width, t->height, (unsigned long long)ph, pi, !pg ? "queued" : s_pack_load_n != pg_loads ? "load" : "hit",
+                    !e ? "new-slot" : "content-changed");
+    }
     { uint64_t upload_started=work_timing_on()?qpc_us():0;
-    if (e && (rp || e->repl)) {                          /* size changes: remake the GPU texture */
+    if (e && (pg || e->repl)) {                          /* size changes: remake the GPU texture */
         if (e->srv) ID3D11ShaderResourceView_Release(e->srv);
         if (e->tex) ID3D11Texture2D_Release(e->tex);
         memset(e, 0, sizeof *e);
         remake = 1;
     }
     if (!e || remake) {
-        s_tex_create_n++;
+        if (!pg) s_tex_create_n++;
         D3D11_TEXTURE2D_DESC td;
         D3D11_SUBRESOURCE_DATA sd;
         HRESULT hr;
-        const uint32_t *up = rp ? rp : s_scratch;
-        uint32_t uw = rp ? rw_ : t->width, uh = rp ? rh_ : t->height;
+        const uint32_t *up = s_scratch;
+        uint32_t uw = t->width, uh = t->height;
         if (remake) { /* keep the slot */ }
         else if (s_ntex < MAX_TEX) e = &s_tex[s_ntex++];
         else {                                           /* evict the least recently used */
@@ -2185,7 +2560,12 @@ static TexEntry *get_texture(const Nv2aTexture *t)
         td.Usage = D3D11_USAGE_DEFAULT;
         td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         sd.pSysMem = up; sd.SysMemPitch = uw * 4; sd.SysMemSlicePitch = 0;
-        if ((tex_want_mips() || rp) && uw >= 4 && uh >= 4) {
+        if (pg) {                                        /* the pack image's texture, shared with the pack cache */
+            e->tex = pg->tex; e->srv = pg->srv;
+            if (!pg_owned) { ID3D11Texture2D_AddRef(e->tex); ID3D11ShaderResourceView_AddRef(e->srv); }
+            e->mips = 1;
+            hr = S_OK;
+        } else if (tex_want_mips() && uw >= 4 && uh >= 4) {
             td.MipLevels = 0;                                    /* the full chain */
             td.BindFlags |= D3D11_BIND_RENDER_TARGET;            /* GenerateMips needs it */
             td.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
@@ -2214,7 +2594,7 @@ static TexEntry *get_texture(const Nv2aTexture *t)
         }
         e->off = t->offset; e->color = t->color; e->w = t->width; e->h = t->height;
         e->pitch = t->pitch;
-        e->repl = rp != NULL;
+        e->repl = pg != NULL;
         if (g.log && s_ntex <= 40)
             logf_("new texture off 0x%08X fmt 0x%X %ux%u pitch %u\n", t->offset, t->color,
                   t->width, t->height, t->pitch);
@@ -2226,6 +2606,7 @@ static TexEntry *get_texture(const Nv2aTexture *t)
     s_up_n++;
     if(upload_started)s_tex_upload_us+=qpc_us()-upload_started;
     }
+    e->pack_wait = (!pg && pi >= 0 && s_pack_async) ? pi + 1 : 0;
     e->hash = h;
     e->sample = span ? sample_span((const uint8_t *)xbox_GetMemoryOffset() + t->offset, span) : 0;
     e->full_us = t0;
@@ -3781,6 +4162,7 @@ static void frame_csv(void)
     static uint32_t draws, tris, compiles;
     static uint64_t draw_us, hash_us, decode_us, decodes, uploads;
     static uint64_t binds, emitted, skipped, cb_uploads, cb_skipped, cb_bytes, bulk_words, bulk_packets, physical, merged, flushes;
+    static uint64_t pack_loads, pack_load_us, pack_create_us, pack_hits;
     uint64_t bw, bp;
     static uint64_t work_previous[14];
     uint64_t work[14];
@@ -3793,7 +4175,7 @@ static void frame_csv(void)
         out = fopen(path, "w");
         if (!out) { logf_("cannot open frame CSV: %s\n", path); return; }
         setvbuf(out, NULL, _IOFBF, 65536);
-        fputs("tick_ms,flip,interval_ms,draws,triangles,draw_cpu_wall_ms,texture_hash_ms,texture_decode_ms,decodes,uploads,shader_compiles,bind_calls,bind_emitted,bind_skipped,cb_uploads,cb_skipped,cb_bytes,bulk_words,bulk_packets,physical_draws,merged_draws,batch_flushes,gvs_prepare_ms,gvs_submit_ms,gvs_guest_bytes,gvs_ring_map_ms,gvs_ring_copy_ms,gvs_ring_bytes,texture_upload_ms,texture_creates,texture_scratch_grows,pixel_hash_ms,pixel_hash_calls,pixel_hash_skips,vsh_export_hits,vsh_export_misses\n", out);
+        fputs("tick_ms,flip,interval_ms,draws,triangles,draw_cpu_wall_ms,texture_hash_ms,texture_decode_ms,decodes,uploads,shader_compiles,bind_calls,bind_emitted,bind_skipped,cb_uploads,cb_skipped,cb_bytes,bulk_words,bulk_packets,physical_draws,merged_draws,batch_flushes,gvs_prepare_ms,gvs_submit_ms,gvs_guest_bytes,gvs_ring_map_ms,gvs_ring_copy_ms,gvs_ring_bytes,texture_upload_ms,texture_creates,texture_scratch_grows,pixel_hash_ms,pixel_hash_calls,pixel_hash_skips,vsh_export_hits,vsh_export_misses,pack_loads,pack_load_ms,pack_create_ms,pack_cache_hits,pack_cache_mb\n", out);
         QueryPerformanceFrequency(&frequency);
     }
     if (!out) return;
@@ -3822,6 +4204,9 @@ static void frame_csv(void)
             if(wi==0 || wi==1 || wi==3 || wi==4 || wi==6 || wi==9)fprintf(out,",%.3f",(double)delta/1000.0);
             else fprintf(out,",%llu",(unsigned long long)delta);
         }
+        fprintf(out, ",%llu,%.3f,%.3f,%llu,%.1f", (unsigned long long)(s_pack_load_n-pack_loads),
+                (double)(s_pack_load_us-pack_load_us)/1000.0, (double)(s_pack_create_us-pack_create_us)/1000.0,
+                (unsigned long long)(s_pack_hit_n-pack_hits), (double)s_pack_gpu_bytes/1048576.0);
         fputc('\n',out);
     }
     memcpy(work_previous,work,sizeof work);
@@ -3832,6 +4217,7 @@ static void frame_csv(void)
     binds=s_bind_calls;emitted=s_bind_emitted;skipped=s_bind_skipped;
     cb_uploads=s_cb_uploads;cb_skipped=s_cb_skipped;cb_bytes=s_cb_bytes;bulk_words=bw;bulk_packets=bp;
     physical=s_physical_draws;merged=s_merged_draws;flushes=s_batch_flushes;
+    pack_loads=s_pack_load_n;pack_load_us=s_pack_load_us;pack_create_us=s_pack_create_us;pack_hits=s_pack_hit_n;
 }
 
 /* Explicit diagnostic readback, independent of verbose periodic GPU reports.
@@ -3872,6 +4258,7 @@ static void be_flip(void)
     constants_invalidate();
 
     if (!init_window_and_device()) return;
+    pack_pump();
     pace_present();
     for (i = 0; i < g.nrt; i++) {
         RenderTarget *r = &g.rt[i];

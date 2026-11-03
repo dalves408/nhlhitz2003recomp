@@ -88,3 +88,7 @@ An Xbox/XInput controller works directly. Keyboard:
   toolkit files and keep their licenses.
 - NHL Hitz 2003 is © Midway. This project is not affiliated with or endorsed by Midway, the NHL or Microsoft, and it
   distributes no game code or assets.
+
+Windows replacement-pack DDS support, caching, asynchronous loading, controls
+and measured limitations are documented in
+[Windows texture performance](docs/WINDOWS_TEXTURE_PERFORMANCE.md).
