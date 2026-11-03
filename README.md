@@ -5,6 +5,12 @@ statically recompiled to C and runs on a Windows host runtime: D3D11 graphics, X
 
 Work in progress. A prebuilt installer is on the [releases page](https://github.com/dalves408/nhlhitz2003recomp/releases).
 
+Windows **1.0.1** adds graphics-memory recovery between modes, improved sound-effect
+resampling, protection against persistent audio buzz, faster DDS texture-pack
+loading and runtime video-setting logs. See the [release notes](docs/RELEASE-1.0.1.md)
+for validation and remaining limits. The public installer contains no debug kit
+or game/texture-pack assets and preserves existing settings and saves.
+
 **No game data is included.** You need your own legally owned copy of the game (Title ID `0x4D57000B`). The ISO, its
 extracted files, the XBE and the C generated from it are never committed.
 
@@ -82,3 +88,6 @@ An Xbox/XInput controller works directly. Keyboard:
 Windows replacement-pack DDS support, caching, asynchronous loading, controls
 and measured limitations are documented in
 [Windows texture performance](docs/WINDOWS_TEXTURE_PERFORMANCE.md).
+
+The graphics-pool exhaustion fix and timestamped runtime video-setting logs
+are described in [Windows memory recovery](docs/WINDOWS_MEMORY_RECOVERY.md).

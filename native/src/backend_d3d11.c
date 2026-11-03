@@ -303,6 +303,7 @@ static void cfg_put_s(const char *sec, const char *key, int v)
 }
 
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+static void video_log_state(const char *event);
 
 #ifdef NHL_RELEASE
 #define DEFAULT_FRAME_RATE 60
@@ -346,6 +347,7 @@ static void settings_load(void)
         for (i = 0; i < 5; i++) s_cat_on[i] = cfg_get_s("textures", k[i], 1) != 0;
         pack_init();
     }
+    video_log_state("startup");
 }
 
 static const char *const SET_LABEL[SET_ITEMS] = {
@@ -409,8 +411,28 @@ static const char *set_text(int i)
 
 static void aspect_on_size(void);
 
+/* Changes only, never per-frame: correlate settings with xrdbg marks/hangs. */
+static void video_log_state(const char *event)
+{
+    SYSTEMTIME now;
+    GetLocalTime(&now);
+    fprintf(stderr, "[VIDEO] %02u:%02u:%02u.%03u tick_ms=%llu frames=%llu event=%s "
+            "scale=%dx applied_scale=%dx msaa=%dx effective_msaa=%dx applied_msaa=%dx "
+            "aniso=%dx fullscreen=%d stretch=%d vsync=%d cap_hz=%u present_override=%d "
+            "hires_enabled=%d pack_installed=%d hires_active=%d categories=%d,%d,%d,%d,%d\n",
+            now.wHour, now.wMinute, now.wSecond, now.wMilliseconds,
+            (unsigned long long)GetTickCount64(), (unsigned long long)g.flips, event,
+            s_scale, s_scale_applied, s_msaa, msaa_effective(), s_msaa_applied,
+            s_aniso, s_fs, s_stretch, g.vsync, SET_FPS_HZ[s_fpsi], s_present_override,
+            s_hires, pack_installed(), s_hires && s_scale >= 2 && pack_installed(),
+            s_cat_on[0], s_cat_on[1], s_cat_on[2], s_cat_on[3], s_cat_on[4]);
+    fflush(stderr);
+}
+
 static void set_put(int i, int v)
 {
+    char previous[80];
+    snprintf(previous, sizeof previous, "%s", set_text(i));
     switch (i) {
     case IT_RES:
         if ((s_scale >= 2) != (v + 1 >= 2)) s_tex_flush = 1;      /* the pack starts or stops being used */
@@ -425,6 +447,10 @@ static void set_put(int i, int v)
     case IT_AA: s_msaa = v ? 1 << v : 1; cfg_put("msaa", s_msaa); break;       /* applied by the next draw */
     case IT_ANISO: s_aniso = v ? 1 << v : 1; cfg_put("anisotropy", s_aniso); break;
     case IT_HIRES: s_hires = v; cfg_put_s("textures", "enabled", v); s_tex_flush = 1; break;   /* cached textures are re-made */
+    }
+    if (i != IT_FS && strcmp(previous, set_text(i))) {
+        fprintf(stderr, "[VIDEO] change %s: %s -> %s\n", SET_LABEL[i], previous, set_text(i));
+        video_log_state("settings-change");
     }
 }
 
@@ -960,6 +986,7 @@ static int init_window_and_device(void)
         return 0;
     }
     logf_("device up, feature level 0x%X\n", (unsigned)fl);
+    video_log_state("device-ready");
     shader_prewarm();
     if (!init_pipeline()) { g.failed = 1; return 0; }
     return 1;
@@ -2723,6 +2750,7 @@ static void rt_reset_all(void)
     s_scale_applied = s_scale;
     s_msaa_applied = s_msaa;
     logf_("internal resolution %dx (%dx%d)\n", s_scale, 640 * s_scale, 480 * s_scale);
+    video_log_state("render-target-settings-applied");
 }
 
 /* RECOMP_D3D11_ZTEX=1 (2 = also dump): a texture whose guest address is the zeta buffer reads the depth
@@ -3797,6 +3825,7 @@ static WINDOWPLACEMENT s_fs_wp;
 
 static void toggle_fullscreen(HWND h)
 {
+    int previous = s_fs;
     if (!s_fs) {
         MONITORINFO mi;
         memset(&mi, 0, sizeof mi);
@@ -3822,6 +3851,8 @@ static void toggle_fullscreen(HWND h)
                      SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
         logf_("F11: windowed\n");
     }
+    fprintf(stderr, "[VIDEO] change Fullscreen: %s -> %s\n", previous ? "On" : "Off", s_fs ? "On" : "Off");
+    video_log_state("fullscreen-change");
 }
 
 /* The player build starts fullscreen and remembers the last mode in
