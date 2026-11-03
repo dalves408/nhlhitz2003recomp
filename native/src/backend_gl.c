@@ -11,10 +11,13 @@
 #include <time.h>
 #include "nv2a_pbx.h"
 #include "input/keyboard_sdl.h"
+#include "texture_content_hash.h"
+#include "gl_texture_pack.h"
+#include "linux_performance.h"
 
 typedef struct { uint32_t va,w,h,format; GLuint fbo,color,depth,attached_depth; unsigned uses; } Target;
 typedef struct { Nv2aTexture key; uint64_t hash; GLuint id; uint64_t used;
-    unsigned char *snapshot;size_t snapshot_size;int valid; } Texture;
+    unsigned char *snapshot;size_t snapshot_size;int valid,pack_index; } Texture;
 typedef struct { float p[4],color[4],d1[4],tc[4][4],fog; } Vertex;
 static SDL_Window *window;
 static SDL_GLContext context;
@@ -38,6 +41,10 @@ static uint32_t *pixels;
 static size_t pixel_cap;
 static FILE *frame_csv;
 static unsigned scale=1;
+static unsigned sampled_mips=1;
+static float anisotropy=1;
+static HitzGlPackStats last_pack_stats;
+static uint64_t title_flips,title_draws;
 static double present_hz=60;
 static uint64_t next_present_ns;
 static Nv2aRenderState previous_state;
@@ -47,6 +54,12 @@ static GLuint bound_textures[4],bound_samplers[4],bound_framebuffer;
 static unsigned viewport_w,viewport_h;
 extern void xbox_InputSetMainPump(int);
 static char *read_shader_file(const char *name);
+
+static void pack_invalidate_bindings(GLuint id)
+{
+    if(!id){active_texture_unit=0;for(unsigned i=0;i<4;i++)bound_textures[i]=~0u;}
+    else for(unsigned i=0;i<4;i++)if(bound_textures[i]==id)bound_textures[i]=~0u;
+}
 
 static void texture_unit(unsigned unit)
 {
@@ -158,8 +171,16 @@ static void init(void)
     glGenTextures(1,&white);texture_bind(white);uint32_t w=0xffffffff;
     glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,1,1,0,GL_BGRA,GL_UNSIGNED_BYTE,&w);
     glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
-    const char *csv=getenv("RECOMP_FRAME_CSV");if(csv){frame_csv=fopen(csv,"w");if(frame_csv){setvbuf(frame_csv,NULL,_IOFBF,65536);fprintf(frame_csv,"frame,seconds,interval_ms,draws,draw_cpu_ms,hash_ms,decode_ms,hash_bytes,decodes,uploads,cpu_vertices,gpu_vertices,capture,shader_compiles\n");}}
+    const char *csv=getenv("RECOMP_FRAME_CSV");if(csv){frame_csv=fopen(csv,"w");if(frame_csv){setvbuf(frame_csv,NULL,_IOFBF,65536);fprintf(frame_csv,"frame,seconds,interval_ms,draws,draw_cpu_ms,hash_ms,decode_ms,hash_bytes,decodes,uploads,cpu_vertices,gpu_vertices,capture,shader_compiles,pack_loads,pack_load_ms,pack_create_ms,pack_cache_hits,pack_cache_mb,pack_pending_mb,pack_queue_jobs,pack_evictions,pack_failures\n");}}
     const char *sc=getenv("RECOMP_RENDER_SCALE");if(sc)scale=(unsigned)atoi(sc);if(scale<1||scale>5)scale=1;
+    if(getenv("RECOMP_ANISOTROPY"))anisotropy=(float)atof(getenv("RECOMP_ANISOTROPY"));
+    if(!(anisotropy>=1&&anisotropy<=16))anisotropy=1;
+    if(epoxy_gl_version()>=46||epoxy_has_gl_extension("GL_EXT_texture_filter_anisotropic")){
+        GLfloat max_aniso;glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT,&max_aniso);if(anisotropy>max_aniso)anisotropy=max_aniso;
+    }else anisotropy=1;
+    hitz_gl_pack_init(scale,pack_invalidate_bindings);
+    atexit(hitz_gl_pack_shutdown);
+    hitz_linux_performance_init();atexit(hitz_linux_performance_shutdown);
     last_report=last_present=SDL_GetPerformanceCounter();
 }
 
@@ -261,6 +282,7 @@ static int decode_texture(const Nv2aTexture *t,uint32_t *out)
 }
 static GLuint texture(const Nv2aTexture *t)
 {
+    sampled_mips=1;
     if(!t||!t->width||!t->height||t->width>4096||t->height>4096)return white;
     for(int i=0;i<32;i++)if(targets[i].color&&targets[i].va==t->offset&&targets[i].w==t->width&&targets[i].h==t->height)return targets[i].color;
     size_t count=(size_t)t->width*t->height;
@@ -272,7 +294,7 @@ static GLuint texture(const Nv2aTexture *t)
         if(!textures[i].id){old=&textures[i];}
         else if(old->id&&textures[i].used<old->used)old=&textures[i];
     }
-    if(!e){e=old;snapshot_release(e);e->key=*t;if(!e->id)glGenTextures(1,&e->id);}
+    if(!e){e=old;snapshot_release(e);e->key=*t;e->pack_index=-1;if(!e->id)glGenTextures(1,&e->id);}
     const unsigned char *raw=base&&span?(const unsigned char *)((uintptr_t)base+t->offset):NULL;
     uint64_t hash_start=frame_csv?SDL_GetPerformanceCounter():0,hash=0;
     int changed=!e->valid;
@@ -290,10 +312,19 @@ static GLuint texture(const Nv2aTexture *t)
     if(changed){
         if(raw&&!decode_texture(t,pixels))return white;
         glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,t->width,t->height,0,GL_BGRA,GL_UNSIGNED_BYTE,pixels);upload_count++;
+        e->pack_index=-1;
+        if(hitz_gl_pack_active(scale)){
+            uint64_t key=0;
+            if(px_hash_for_use(1,(int)scale,1,0,t->width,t->height,pixels,&key))e->pack_index=hitz_gl_pack_find(key);
+        }
     }
     if(raw){int allocated=snapshot_allocate(e,span);if(e->snapshot&&(changed||allocated))memcpy(e->snapshot,raw,span);}
     e->hash=hash;e->valid=1;
     e->used=flips;
+    if(hitz_gl_pack_active(scale)&&e->pack_index>=0){
+        GLuint replacement=hitz_gl_pack_get(e->pack_index,flips,&sampled_mips);
+        if(replacement)return replacement;
+    }
     return e->id;
 }
 
@@ -336,16 +367,18 @@ static void render_state(const Nv2aRenderState *s)
     if(invalid||s->color_mask!=o->color_mask)glColorMask((s->color_mask&0x10000)!=0,(s->color_mask&0x100)!=0,(s->color_mask&1)!=0,(s->color_mask&0x1000000)!=0);
     previous_state=*s;state_valid=1;
 }
-static GLuint sampler(const Nv2aTexture *t)
+static GLuint sampler(const Nv2aTexture *t,unsigned levels)
 {
-    static GLuint cache[4][4][2];
+    static GLuint cache[4][4][2][2];
     unsigned u=t?t->addr_u:3,v=t?t->addr_v:3;
     u=u==1?0:u==2?1:u==4?2:3;v=v==1?0:v==2?1:v==4?2:3;
     unsigned point=t&&((t->filter>>16)&255)==1&&((t->filter>>24)&15)==1;
-    GLuint *id=&cache[u][v][point];
+    unsigned mipped=levels>1;
+    GLuint *id=&cache[u][v][point][mipped];
     if(!*id){static const GLenum modes[]={GL_REPEAT,GL_MIRRORED_REPEAT,GL_CLAMP_TO_BORDER,GL_CLAMP_TO_EDGE};
         glGenSamplers(1,id);glSamplerParameteri(*id,GL_TEXTURE_WRAP_S,modes[u]);glSamplerParameteri(*id,GL_TEXTURE_WRAP_T,modes[v]);
-        glSamplerParameteri(*id,GL_TEXTURE_MIN_FILTER,point?GL_NEAREST:GL_LINEAR);glSamplerParameteri(*id,GL_TEXTURE_MAG_FILTER,point?GL_NEAREST:GL_LINEAR);}
+        glSamplerParameteri(*id,GL_TEXTURE_MIN_FILTER,mipped?(point?GL_NEAREST_MIPMAP_NEAREST:GL_LINEAR_MIPMAP_LINEAR):(point?GL_NEAREST:GL_LINEAR));glSamplerParameteri(*id,GL_TEXTURE_MAG_FILTER,point?GL_NEAREST:GL_LINEAR);
+        if(mipped&&!point&&anisotropy>1)glSamplerParameterf(*id,GL_TEXTURE_MAX_ANISOTROPY_EXT,anisotropy);}
     return *id;
 }
 #include "gl_gpu_vertex.inc"
@@ -386,7 +419,7 @@ static void draw(const Nv2aSurface *s,const Nv2aBatch *b)
         const Nv2aTexture *t=!needed?NULL:x&&x->tex_valid[k]?&x->tex[k]:(k==0?b->texture:NULL);
         if(t)texture_unit(k);
         GLuint id=texture(t);texture_bind_unit(k,id);
-        GLuint samp=sampler(t);if(bound_samplers[k]!=samp){glBindSampler(k,samp);bound_samplers[k]=samp;}
+        GLuint samp=sampler(t,sampled_mips);if(bound_samplers[k]!=samp){glBindSampler(k,samp);bound_samplers[k]=samp;}
         uvs[k][0]=t&&!(x&&x->tex_sized[k])?1.f/t->width:1;uvs[k][1]=t&&!(x&&x->tex_sized[k])?1.f/t->height:1;uvs[k][2]=t?1:0;
     }
     uniform4fv(U_UVS,4,&uvs[0][0]);
@@ -435,10 +468,28 @@ static void flip(void)
         }
         SDL_GL_SwapWindow(window);
     }
+    hitz_gl_pack_pump(flips);
     uint64_t now=SDL_GetPerformanceCounter();double freq=(double)SDL_GetPerformanceFrequency();
-    if(frame_csv)fprintf(frame_csv,"%llu,%.6f,%.6f,%llu,%.6f,%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%u,%u\n",(unsigned long long)flips,now/freq,(now-last_present)*1000/freq,(unsigned long long)draws,draw_ticks*1000/freq,hash_ticks*1000/freq,decode_ticks*1000/freq,(unsigned long long)hashed_bytes,(unsigned long long)decode_count,(unsigned long long)upload_count,(unsigned long long)cpu_vertices,(unsigned long long)gpu_vertices,captured,program_count-programs_at_last_flip);
+    HitzGlPackStats pack;hitz_gl_pack_stats(&pack);
+    if(frame_csv){
+        fprintf(frame_csv,"%llu,%.6f,%.6f,%llu,%.6f,%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%u,%u",(unsigned long long)flips,now/freq,(now-last_present)*1000/freq,(unsigned long long)draws,draw_ticks*1000/freq,hash_ticks*1000/freq,decode_ticks*1000/freq,(unsigned long long)hashed_bytes,(unsigned long long)decode_count,(unsigned long long)upload_count,(unsigned long long)cpu_vertices,(unsigned long long)gpu_vertices,captured,program_count-programs_at_last_flip);
+        fprintf(frame_csv,",%llu,%.6f,%.6f,%llu,%.6f,%.6f,%u,%llu,%llu\n",(unsigned long long)(pack.loads-last_pack_stats.loads),(pack.load_us-last_pack_stats.load_us)/1000.0,(pack.create_us-last_pack_stats.create_us)/1000.0,(unsigned long long)(pack.hits-last_pack_stats.hits),pack.resident_bytes/1048576.0,pack.pending_bytes/1048576.0,pack.queued,(unsigned long long)(pack.evictions-last_pack_stats.evictions),(unsigned long long)(pack.failures-last_pack_stats.failures));
+    }
+    last_pack_stats=pack;
     programs_at_last_flip=program_count;
-    if(now-last_report>(uint64_t)freq){char title[128];snprintf(title,sizeof(title),"NHL Hitz 2003 — Linux | frame %llu | %.1f ms",(unsigned long long)flips,(now-last_present)*1000/freq);SDL_SetWindowTitle(window,title);last_report=now;if(frame_csv)fflush(frame_csv);}
+    title_draws+=draws;
+    if(now-last_report>=(uint64_t)freq){
+        double secs=(now-last_report)/freq,fps=(flips+1-title_flips)/secs;
+        int cpu,gpu;hitz_linux_performance_sample(&cpu,&gpu);
+        char title[192],cpu_text[24],gpu_text[24];
+        if(cpu>=0)snprintf(cpu_text,sizeof(cpu_text),"%d%%",cpu);else snprintf(cpu_text,sizeof(cpu_text),"N/A");
+        if(gpu>=0)snprintf(gpu_text,sizeof(gpu_text),"%d%%",gpu);else snprintf(gpu_text,sizeof(gpu_text),"N/A");
+        double per_frame=(flips+1-title_flips)?(double)title_draws/(flips+1-title_flips):0;
+        snprintf(title,sizeof(title),"NHL Hitz 2003 - OpenGL | FPS: %.1f | CPU: %s | GPU: %s | draws/frame: %.0f",fps,cpu_text,gpu_text,per_frame);
+        SDL_SetWindowTitle(window,title);
+        if(getenv("RECOMP_PERF_LOG"))fprintf(stderr,"[PERF] fps=%.3f process_cpu_pct=%d gpu_pct=%d logical_cpu_normalized=1 draws_per_frame=%.1f\n",fps,cpu,gpu,per_frame);
+        title_flips=flips+1;title_draws=0;last_report=now;if(frame_csv)fflush(frame_csv);
+    }
     for(int i=0;i<32;i++)targets[i].uses=0;flips++;draws=0;last_present=now;
     draw_ticks=hash_ticks=decode_ticks=hashed_bytes=decode_count=upload_count=cpu_vertices=gpu_vertices=0;
 }

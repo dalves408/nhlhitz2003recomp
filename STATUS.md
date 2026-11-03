@@ -1,13 +1,36 @@
 # NHL Hitz 2003 Windows / Linux Recomp — Status
 
+## Linux parity work (2026-11-03)
+
+Development resumed on `codex/linux-texture-parity`. Windows texture changes
+were reviewed, built, tested and preserved as local checkpoint `26638e2`, then
+cherry-picked here as `8d99b1e`. A dedicated Ubuntu 24.04 WSL2 environment now
+builds and tests the Linux player with accelerated RTX 3070 OpenGL and audio.
+
+Implemented Linux DDS/PNG/BMP pack lookup, compressed DDS uploads with stored
+mips, bounded content-keyed LRU residency, asynchronous reads/decodes and
+render-thread upload pumping. Exact native texture mutation checks remain.
+The window title now displays FPS, CPU% normalized consistently with Windows,
+and GPU% or `N/A`, updated approximately once per second.
+
+Nine portable tests and both GPU test executables pass. The unchanged Linux
+baseline reached live gameplay; the verified 38.21-second window averaged
+9.89 FPS. This WSLg measurement is not a native Radeon result. A second
+seven-minute run loaded the BC7 pack at 2x and reached live Nashville–Atlanta
+play with zero reported pack failures and 88 MiB resident cache. Its verified
+35.29-second gameplay window averaged 9.52 FPS; different settings and teams
+prevent an optimization comparison. Controlled performance comparisons, full-match
+completion and 60 FPS remain open. See
+[Linux texture performance](docs/LINUX_TEXTURE_PERFORMANCE.md) for controls,
+test details and the remaining optimization order.
+
 ## Linux branch checkpoint (2026-11-02)
 
 Branch: `codex/linux-native`, based on upstream `main` at `291d1d9`.
 The Linux changes have been reapplied after upstream rewrote its history and
 removed historical documentation and packaging files. This file records only
 the Linux checkpoint; it does not restore the removed Windows status history.
-Development is paused at the owner's request. No build or gameplay probe is
-currently running.
+This section records the earlier paused checkpoint; work resumed above.
 
 ## Current native Linux result
 

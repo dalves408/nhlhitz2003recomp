@@ -92,3 +92,7 @@ An Xbox/XInput controller works directly. Keyboard:
 Windows replacement-pack DDS support, caching, asynchronous loading, controls
 and measured limitations are documented in
 [Windows texture performance](docs/WINDOWS_TEXTURE_PERFORMANCE.md).
+
+Linux DDS replacement loading, bounded asynchronous caching, mip filtering,
+the Windows-style FPS/CPU/GPU title, WSL test setup and validation limits are
+documented in [Linux texture performance](docs/LINUX_TEXTURE_PERFORMANCE.md).

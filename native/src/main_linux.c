@@ -1,6 +1,8 @@
 /* Native Linux host for the same generated Xbox guest and project fixes. */
 #include <xbox/xboxrecomp.h>
 #include <SDL2/SDL.h>
+#include "gl_texture_pack.h"
+#include "linux_performance.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <execinfo.h>
@@ -132,6 +134,7 @@ int main(int argc, char **argv)
     xbox_WatchdogStart();
     fprintf(stderr,"[BOOT] starting Xbox entry at 001C5F4E, ESP=%08X\n",g_esp);
     xbe_entry_point();
+    hitz_linux_performance_shutdown(); hitz_gl_pack_shutdown();
     xbox_kernel_shutdown(); xbox_MemoryLayoutShutdown(); free(bytes); SDL_Quit();
     return 0;
 }
