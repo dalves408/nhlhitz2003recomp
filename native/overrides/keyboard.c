@@ -187,6 +187,56 @@ static void keymap_load(void)
         s_ovr[i][1] = (uint8_t)(k1 >= 0 && k1 < 256 ? k1 : xbox_key_map[i].vk[1]);
         s_ovr_set[i] = 1;
     }
+#else
+    /* PROJECT OVERRIDE (JOJO item 23): the Linux settings app (jojo/config/nhl_config.py) writes
+     * the same file, same keys, same Windows virtual-key codes, in the game's data folder beside
+     * settings.ini: $XDG_DATA_HOME/nhlhitz2003/keymap.ini, else ~/.local/share/nhlhitz2003.
+     * keyboard_sdl.c turns SDL keycodes into those VK codes, so a code means the same key. */
+    static const char *const ids[NHL_KEYMAP_COUNT] = {
+#define X(id, label, k0, k1) #id,
+        NHL_KEYMAP(X)
+#undef X
+    };
+    int got[NHL_KEYMAP_COUNT][2];
+    char path[4096], line[256], section[64] = "";
+    const char *xdg = getenv("XDG_DATA_HOME"), *home = getenv("HOME");
+    FILE *f;
+    int i;
+
+    if (xdg && *xdg) snprintf(path, sizeof path, "%s/nhlhitz2003/keymap.ini", xdg);
+    else if (home && *home) snprintf(path, sizeof path, "%s/.local/share/nhlhitz2003/keymap.ini", home);
+    else return;
+    if (!(f = fopen(path, "r")))
+        return;
+    memset(got, -1, sizeof got);
+    while (fgets(line, sizeof line, f)) {
+        char *s = line, *e, *eq;
+        while (*s == ' ' || *s == '\t') s++;
+        for (e = s + strlen(s); e > s && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ' || e[-1] == '\t'); ) *--e = 0;
+        if (*s == '[') { snprintf(section, sizeof section, "%s", s); continue; }
+        if (strcmp(section, "[keys]") || !(eq = strchr(s, '=')))
+            continue;
+        *eq = 0;
+        for (e = eq; e > s && (e[-1] == ' ' || e[-1] == '\t'); ) *--e = 0;
+        for (i = 0; i < NHL_KEYMAP_COUNT; i++) {
+            size_t n = strlen(ids[i]);
+            if (!strncmp(s, ids[i], n) && (!s[n] || !strcmp(s + n, "_alt"))) {
+                char *v = eq + 1, *end;
+                long k = strtol(v, &end, 10);
+                if (end != v) got[i][s[n] ? 1 : 0] = (int)k;
+                break;
+            }
+        }
+    }
+    fclose(f);
+    for (i = 0; i < NHL_KEYMAP_COUNT && (size_t)i < xbox_key_map_count; i++) {
+        int k0 = got[i][0], k1 = got[i][1];
+        if (k0 < 0 && k1 < 0)
+            continue;
+        s_ovr[i][0] = (uint8_t)(k0 >= 0 && k0 < 256 ? k0 : xbox_key_map[i].vk[0]);
+        s_ovr[i][1] = (uint8_t)(k1 >= 0 && k1 < 256 ? k1 : xbox_key_map[i].vk[1]);
+        s_ovr_set[i] = 1;
+    }
 #endif
 }
 
