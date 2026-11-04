@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=NHL Hitz 2003 Settings
+Comment=Video and texture settings for NHL Hitz 2003 (same as the in-game F1 menu)
+Exec=/usr/bin/python3 @REPO@/linux/nhl_config.py
+Path=@REPO@
+Icon=nhlhitz2003
+Terminal=false
+Categories=Game;Settings;
