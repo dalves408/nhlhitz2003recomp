@@ -15,9 +15,9 @@ BEGIN
    VALUE "CompanyName", "dalves408/nhlhitz2003recomp"
    VALUE "FileDescription", "NHL Hitz 2003 recompilation (work in progress)"
    VALUE "FileVersion", "@HITZ_PACKAGE_VERSION@.0"
-   VALUE "InternalName", "nhl_hitz_2003_recomp"
+   VALUE "InternalName", "@HITZ_GAME_BINARY@"
    VALUE "LegalCopyright", "Fan-made recompilation. Game assets are not included."
-   VALUE "OriginalFilename", "nhl_hitz_2003_recomp.exe"
+   VALUE "OriginalFilename", "@HITZ_GAME_BINARY@.exe"
    VALUE "ProductName", "NHL Hitz 2003"
    VALUE "ProductVersion", "@HITZ_PACKAGE_VERSION@"
   END

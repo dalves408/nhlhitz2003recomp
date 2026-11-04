@@ -25,6 +25,11 @@ Enable Hi-res textures in F1 with render scale at least 2x. Put the pack under
 `%LOCALAPPDATA%\NHLHitz2003\texture_pack`, or select a directory explicitly with
 `RECOMP_TEXPACK`. Game data and texture packs are not distributed in this repo.
 
+F8 toggles the installed pack through the same settings/cache-invalidation path
+as F1 and persists `[textures] enabled`. Native 1x scale, a missing pack and held-key
+auto-repeat do not toggle it. F8 is reserved by the game and cannot be assigned
+to a gameplay action in config.exe.
+
 | Setting | Default | Purpose |
 |---|---:|---|
 | `RECOMP_PACK_CACHE` | 1 | Reuse replacement GPU images; 0 selects synchronous uncached loading |

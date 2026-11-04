@@ -41,6 +41,9 @@
 #include "nv2a_pbx.h"        /* project: combiner state for batches that have it */
 #include "nv2a_surface_formats.h"
 #include "shader_cache_format.h"
+#ifdef XRDBG
+#include "hitz_debug_banner.h"
+#endif
 
 /* Graphics thread (RECOMP_GFX_THREAD, on by default): the executor only records each draw, clear, flip and
  * blit; this back end's own thread replays them. s_async says so; while a recorded draw is replayed the
@@ -841,6 +844,9 @@ static int quit_key(WPARAM w, LPARAM l, int down)
 
 static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
+#ifdef XRDBG
+    if(hitz_debug_banner_message(h,m,w,l))return 0;
+#endif
     switch (m) {
     case WM_SIZE:
         if (aspect_on() && w != SIZE_MINIMIZED) aspect_on_size();
@@ -873,6 +879,13 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
             if (!(l & (1L << 30))) { if (!s_q_active) set_open(); else if (s_set_active) quit_close(); }
             return 0;
         }
+        if (w == VK_F8) {                  /* dedicated hi-res toggle; ignore native 1x and repeats */
+            if (!(l & (1L << 30)) && s_scale >= 2 && !set_disabled(IT_HIRES)) {
+                set_put(IT_HIRES, !s_hires);
+                if (s_set_active) set_draw();
+            }
+            return 0;
+        }
         if (quit_key(w, l, 1)) return 0;   /* ESC quit overlay */
         if (!(l & (1L << 30)))          /* not an auto-repeat */
             keylog((int)w, 1);
@@ -881,7 +894,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_KEYUP: case WM_SYSKEYUP:
         if (w == VK_F11 && f11_on()) return 0;
         if (w == VK_RETURN && m == WM_SYSKEYUP && f11_on()) return 0;   /* the Alt+Enter release */
-        if (w == VK_F1) return 0;
+        if (w == VK_F1 || w == VK_F8) return 0;
         if (quit_key(w, l, 0)) return 0;
         keylog((int)w, 0);
         xbox_InputKeySet((int)w, 0);
@@ -954,6 +967,9 @@ static int init_window_and_device(void)
                              WS_OVERLAPPEDWINDOW | WS_VISIBLE, 100, 100, 656, 519,
                              NULL, NULL, wc.hInstance, NULL);
     if (!g.hwnd) { logf_("CreateWindow failed (%lu)\n", GetLastError()); g.failed = 1; return 0; }
+#ifdef XRDBG
+    hitz_debug_banner_attach(g.hwnd);
+#endif
     if (f11_on() && (getenv("RECOMP_D3D11_FULLSCREEN")
         ? atoi(getenv("RECOMP_D3D11_FULLSCREEN")) != 0 : want_fullscreen_at_start())) toggle_fullscreen(g.hwnd);
 
@@ -989,6 +1005,14 @@ static int init_window_and_device(void)
     video_log_state("device-ready");
     shader_prewarm();
     if (!init_pipeline()) { g.failed = 1; return 0; }
+    /* Controller activity does not reset Windows' keyboard/mouse idle timers.
+     * Hold both requests on the window/render thread for its lifetime. Windows
+     * removes them when this thread/process exits, including forced exits.
+     * ES_CONTINUOUS avoids per-frame calls or a polling timer. */
+    if (!SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED))
+        fprintf(stderr, "[POWER] Unable to prevent idle display-off/sleep (error=%lu)\n", GetLastError());
+    else
+        fprintf(stderr, "[POWER] Idle display-off and system sleep inhibited while the game is running\n");
     return 1;
 }
 

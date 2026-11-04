@@ -22,6 +22,9 @@
 #ifndef HITZ_DEBUG_TAG
 #define HITZ_DEBUG_TAG "debug"
 #endif
+#ifndef HITZ_GAME_VERSION
+#error HITZ_GAME_VERSION must be supplied by the debug build configuration
+#endif
 
 extern ptrdiff_t g_xbox_mem_offset;          /* host = guest + offset (xbox_memory_layout.c) */
 extern uint64_t hitz_flip_count(void);       /* backend_d3d11.c: frames presented */
@@ -61,7 +64,7 @@ void hitz_debug_init(void)
     memset(&cfg, 0, sizeof cfg);
     cfg.game_name = "NHL Hitz 2003";
     cfg.data_folder = "NHLHitz2003";
-    cfg.build_tag = HITZ_DEBUG_TAG;
+    cfg.build_tag = "v" HITZ_GAME_VERSION " (" HITZ_DEBUG_TAG ")";
     cfg.window_class = "NhlD3D11Backend";
     cfg.settings_file = "settings.ini";
     cfg.frame_count = hitz_flip_count;

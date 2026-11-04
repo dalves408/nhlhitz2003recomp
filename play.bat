@@ -4,10 +4,12 @@ rem Always resolve paths from this checkout, including when double-clicked.
 pushd "%~dp0" || exit /b 1
 set "HITZ_BUILD_DIR=native\build"
 set "HITZ_DEBUGKIT=OFF"
+set "HITZ_GAME_EXE=nhl_hitz_2003.exe"
 set "HITZ_BUILD_ONLY=0"
 if /i "%~1"=="--debug" (
     set "HITZ_BUILD_DIR=native\build-debug"
     set "HITZ_DEBUGKIT=ON"
+    set "HITZ_GAME_EXE=nhl_hitz_2003-db.exe"
     shift
 )
 if /i "%~1"=="--build-only" (
@@ -55,7 +57,7 @@ if "%HITZ_DEBUGKIT%"=="ON" (
 )
 rem WinMain loads game\default.xbe relative to native, not the project root.
 pushd native || goto failed
-start "" /wait "%~dp0%HITZ_BUILD_DIR%\Release\nhl_hitz_2003_recomp.exe"
+start "" /wait "%~dp0%HITZ_BUILD_DIR%\Release\%HITZ_GAME_EXE%"
 set "HITZ_EXIT=%ERRORLEVEL%"
 popd
 if not "%HITZ_EXIT%"=="0" (
