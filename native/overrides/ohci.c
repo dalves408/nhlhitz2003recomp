@@ -570,6 +570,15 @@ static uint8_t *guest_ptr(uint32_t va, uint32_t bytes)
  * transfer stages, and OUT packets (rumble) by endpoint. */
 static unsigned long s_n_report, s_n_ctrl, s_n_out_ep0, s_n_out_other;
 
+extern const volatile uint8_t *xbox_ContiguousPageMap(void);
+extern const volatile uint8_t *xbox_PhysRamNameMap(void);
+/* RECOMP_RUMBLE_LOG=1: every control-pipe stage, bytes included (first 400). */
+static int ctl_log_on(void){static int v=-1;if(v<0){const char*e=getenv("RECOMP_RUMBLE_LOG");v=e&&*e=='1';}return v;}
+static void ctl_log(const char*what,int pad,const uint8_t*p,int n,int len,int extra)
+{   static int cnt;if(!ctl_log_on()||cnt>=400)return;cnt++;
+    fprintf(stderr,"[USBCTL] %s pad %d len %d (%d):",what,pad,len,extra);
+    for(int i=0;i<n&&i<16;i++){fprintf(stderr," %02X",p[i]);}
+    fprintf(stderr,"\n");fflush(stderr);}
 /* Move one transfer descriptor. Returns the condition code to report. */
 static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
 {
@@ -584,6 +593,8 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
 
     if (pad < 0)
         return TD_CC_NOERROR;   /* no device at that address: ignore */
+    {   static int tl = -1, tn; if (tl < 0) { const char *e = getenv("RECOMP_RUMBLE_LOG"); tl = e && *e == '1'; }
+        if (tl && endpoint != 0 && dp != TD_DP_IN && tn < 40) { tn++; fprintf(stderr, "[RUMBLE] OUT td pad %d ep %u dp %u len %d\n", pad, endpoint, dp, len); } }
 
     if (s_trace) {
         static unsigned n;
@@ -606,6 +617,7 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
             g_setup.wIndex        = (uint16_t)(p[4] | (p[5] << 8));
             g_setup.wLength       = (uint16_t)(p[6] | (p[7] << 8));
             g_setup_pending = 1;
+            ctl_log("SETUP",pad,p,8,len,0);
             g_ctrl_len = -1;   /* answered lazily on the first IN */
             g_ctrl_sent = 0;
             if (s_trace) {
@@ -654,6 +666,7 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
                 memcpy(guest_ptr(cbp, (uint32_t)n),
                        g_ctrl_buf + g_ctrl_sent, (size_t)n);
             g_ctrl_sent += n;
+            ctl_log("IN ep0",pad,g_ctrl_buf+g_ctrl_sent-n,n,len,g_ctrl_len);
             moved = n;
             if (s_trace && n > 0) {
                 fprintf(stderr, "  [OHCI%d] IN ep0 %d bytes (%d/%d)\n",
@@ -678,6 +691,25 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
          * request; Burnout 3 starts its engine-rev rumble on the Crash
          * countdown and then paused with the pad unresponsive. */
         moved = len;
+        if (endpoint == 0) {
+            const uint8_t *q = (len > 0) ? (const uint8_t *)guest_ptr(cbp, (uint32_t)(len < 16 ? len : 16)) : NULL;
+            uint8_t z = 0;
+            ctl_log(g_setup_pending ? "OUT ep0 (setup pending)" : "OUT ep0 (status)", pad, q ? q : &z, q ? len : 0, len,
+                    g_setup_pending ? (g_setup.bmRequestType << 8 | g_setup.bRequest) : -1);
+            if (ctl_log_on() && g_setup_pending && g_setup.bmRequestType == 0x21 && len >= 6) {
+                static int dn; uint8_t *base = (uint8_t *)xbox_GetMemoryOffset();
+                if (dn++ < 4) {
+                    uint32_t cands[3] = { cbp, OHCI_CONTIG_BASE + cbp, cbp | 0x80000000u };
+                    fprintf(stderr, "[USBCTL]   cbp %08X resolved %08X contig_hw %08X image %08X-%08X namemap %d contigmap %d\n",
+                            cbp, bus_resolve(cbp), (unsigned)xbox_ContiguousAllocatedBytes(), g_xbox_image_lo, g_xbox_image_hi,
+                            cbp < OHCI_CONTIG_SIZE ? xbox_PhysRamNameMap()[cbp >> 12] : -1,
+                            cbp < OHCI_CONTIG_SIZE ? xbox_ContiguousPageMap()[cbp >> 12] : -1);
+                    for (int c = 0; c < 3; c++) if (guest_ok(cands[c], 6)) {
+                        const uint8_t *x = base + cands[c];
+                        fprintf(stderr, "[USBCTL]   @%08X: %02X %02X %02X %02X %02X %02X\n", cands[c], x[0], x[1], x[2], x[3], x[4], x[5]); }
+                }
+            }
+        }
         /* Rumble: an XID output report -- 00 06, left motor, right motor
          * (16-bit each) -- on the interrupt OUT endpoint, or as the data of
          * a SET_REPORT (21 09) on the control pipe. Forwarded to the host
@@ -687,6 +719,16 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
                                   && g_setup.bRequest == 0x09))) {
             static int rumble = -1;
             const uint8_t *r = (const uint8_t *)guest_ptr(cbp, 6u);
+            /* Hitz's XAPI builds the report in its own .data (0x0043FFD8),
+             * a page the contiguous map also claims, so bus_resolve reads
+             * the window (all zeroes). If that copy lacks the XID header
+             * and the in-image copy has it, the image bytes are the report. */
+            if (!(r[0] == 0x00 && r[1] >= 6) && cbp >= g_xbox_image_lo
+                    && cbp + 6u <= g_xbox_image_hi && guest_ok(cbp, 6u)) {
+                const uint8_t *im = (const uint8_t *)xbox_GetMemoryOffset() + cbp;
+                if (im[0] == 0x00 && im[1] >= 6)
+                    r = im;
+            }
             if (rumble < 0) {
                 const char *e = getenv("RECOMP_RUMBLE");
                 rumble = !(e && *e == '0');
@@ -695,6 +737,8 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
                 XBOX_VIBRATION v;
                 v.wLeftMotorSpeed  = (WORD)(r[2] | r[3] << 8);
                 v.wRightMotorSpeed = (WORD)(r[4] | r[5] << 8);
+                {   static int rl = -1, rn; if (rl < 0) { const char *e = getenv("RECOMP_RUMBLE_LOG"); rl = e && *e == '1'; }
+                    if (rl && rn < 2000) { rn++; fprintf(stderr, "[RUMBLE] guest report pad %d left %u right %u ep %u\n", pad, v.wLeftMotorSpeed, v.wRightMotorSpeed, endpoint); } }
                 if (s_trace)
                     fprintf(stderr, "  [OHCI%d] rumble pad %d left %u right %u (ep %u)\n",
                             hc->index, pad, v.wLeftMotorSpeed, v.wRightMotorSpeed, endpoint);
