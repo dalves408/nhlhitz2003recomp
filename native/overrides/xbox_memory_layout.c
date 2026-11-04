@@ -15,6 +15,7 @@
 #if !defined(_WIN32) && !defined(_GNU_SOURCE)
 #define _GNU_SOURCE   /* glibc declares dladdr/Dl_info (RECOMP_WATCH) only under it */
 #endif
+#include <time.h>
 #include "xbox_memory_layout.h"
 #include "kernel.h"
 #include "guest_vmem.h"
@@ -1441,8 +1442,15 @@ static void nv2a_ack_busy_bits(int flip_held)
         }
         /* Interlocked: the vblank-ack thread and the guest change other
          * bits of the same word meanwhile. */
-        if (*r & mask)
+        if (*r & mask) {
             InterlockedAnd((volatile LONG *)r, (LONG)~mask);
+#if defined(__linux__)
+            if (NV2A_ACK[i].offset == NV2A_ACK_PFB_FLUSH) {
+                extern void hitz_linux_gpu_wait_notify(volatile uint32_t *reg);
+                hitz_linux_gpu_wait_notify(r);
+            }
+#endif
+        }
     }
 }
 
@@ -1467,6 +1475,32 @@ volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset)
 static volatile LONG s_ack_yield_every=-1;
 void nv2a_pbx_ack_yield_mode(int every)
 {s_ack_yield_every=every<1?1:every>64?64:every;}
+static int jojo_idle_wait_us=-1,jojo_idle_need=64;static unsigned jojo_idle_run;
+uint64_t jojo_pb_idle_ns;static int jojo_prof=-1;static uint64_t jojo_idle_t0; /* item 11 diagnostics */
+volatile unsigned long long jojo_passes,jojo_idle_passes,jojo_sleeps;
+/* JOJO item 8: RECOMP_RENDER_CPUS=<list> (e.g. "0,2" = one physical core) pins the
+ * push-buffer/render thread to those CPUs and every other thread of the process
+ * to the remaining CPUs, re-applied every 10 s to catch new threads. Off when unset. */
+#ifdef __linux__
+#include <sched.h>
+#include <dirent.h>
+#include <sys/syscall.h>
+static void jojo_render_affinity(void)
+{
+    static int on=-1;static cpu_set_t mine,rest;
+    if(on<0){const char *v=getenv("RECOMP_RENDER_CPUS");on=0;if(!v||!*v)return;
+        CPU_ZERO(&mine);for(const char *p=v;*p;){char *e;long c=strtol(p,&e,10);if(e==p)break;if(c>=0&&c<CPU_SETSIZE)CPU_SET((int)c,&mine);p=*e?e+1:e;}
+        long n=sysconf(_SC_NPROCESSORS_ONLN);CPU_ZERO(&rest);for(long c=0;c<n;c++)if(!CPU_ISSET((int)c,&mine))CPU_SET((int)c,&rest);
+        if(!CPU_COUNT(&mine)||!CPU_COUNT(&rest))return;on=1;fprintf(stderr,"[PB] render thread pinned to RECOMP_RENDER_CPUS=%s, other threads to the rest\n",v);}
+    if(!on)return;
+    pid_t self=(pid_t)syscall(SYS_gettid);sched_setaffinity(self,sizeof(mine),&mine);
+    DIR *d=opendir("/proc/self/task");if(!d)return;struct dirent *e;
+    while((e=readdir(d))){pid_t t=(pid_t)atoi(e->d_name);if(t>0&&t!=self)sched_setaffinity(t,sizeof(rest),&rest);}
+    closedir(d);
+}
+#else
+static void jojo_render_affinity(void){}
+#endif
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
@@ -1486,6 +1520,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          * flips paces only the last. */
         extern int nv2a_pb_exec_flip_poll(void);
         int flip_held = nv2a_pb_exec_flip_poll();
+        int jojo_idle = 1;  /* JOJO: no new push-buffer work this pass */
         nv2a_ack_busy_bits(flip_held);
         for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
             volatile uint32_t *r =
@@ -1537,6 +1572,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
             if (!flip_held
                     && (put != last_put || (now_ms - last_put_ms) > 2000)) {
+                jojo_idle = 0;
                 /* Survey the segment the title just submitted, once. */
                 {
                     extern void nv2a_pb_scan(uint32_t);
@@ -1678,6 +1714,21 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
         *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
                                + g_memory_offset) = GetTickCount();
 
+        /* JOJO item 4: RECOMP_PB_IDLE_WAIT_US=N (default 0 = original).
+         * After RECOMP_PB_IDLE_PASSES (default 64) consecutive passes with no
+         * new PUT, sleep N us per pass instead of Sleep(0). Work passes are
+         * never delayed; idle-pass and sleep counts go to the 600-vblank line. */
+        if(jojo_idle_wait_us<0){const char *v=getenv("RECOMP_PB_IDLE_WAIT_US");jojo_idle_wait_us=v?atoi(v):0;
+            v=getenv("RECOMP_PB_IDLE_PASSES");jojo_idle_need=v&&atoi(v)>0?atoi(v):64;
+            if(jojo_idle_wait_us>0)fprintf(stderr,"[PB] idle wait %d us after %d idle passes\n",jojo_idle_wait_us,jojo_idle_need);}
+        {static DWORD jl,ja;DWORD jn=GetTickCount();if(!jl)jl=jn;if(!ja||jn-ja>=10000){ja=jn;jojo_render_affinity();}if(getenv("RECOMP_PERF_LOG")&&jn-jl>=10000){fprintf(stderr,"[PB] passes %llu idle %llu sleeps %llu in %lu ms\n",jojo_passes,jojo_idle_passes,jojo_sleeps,(unsigned long)(jn-jl));jojo_passes=jojo_idle_passes=jojo_sleeps=0;jl=jn;}}
+        jojo_passes++; if(jojo_idle){jojo_idle_run++;jojo_idle_passes++;} else jojo_idle_run=0;
+        if(jojo_prof<0){const char *v=getenv("RECOMP_FRAME_PROFILE");jojo_prof=v&&*v;}
+        if(jojo_prof){struct timespec jt;clock_gettime(CLOCK_MONOTONIC,&jt);uint64_t jn2=(uint64_t)jt.tv_sec*1000000000ull+jt.tv_nsec;
+            if(jojo_idle&&jojo_idle_t0)jojo_pb_idle_ns+=jn2-jojo_idle_t0;jojo_idle_t0=jn2;}
+        if(jojo_idle_wait_us>0&&jojo_idle_run>=(unsigned)jojo_idle_need){
+            struct timespec ts={0,(long)jojo_idle_wait_us*1000};nanosleep(&ts,NULL);jojo_sleeps++;
+        } else
         if(s_ack_yield_every<=1 || ++yield_passes>=(unsigned)s_ack_yield_every){
             yield_passes=0;Sleep(0);
         } else {
@@ -4086,12 +4137,10 @@ void xbox_FreeThreadStack(uint32_t stack_top)
  * it is free. XBOX_GPU_INSTANCE_DEFAULT stays carved off the top for the
  * GPU-instance bridge.
  *
- * Freed blocks are reused only under RECOMP_HEAP_RECLAIM, as before: without
- * it MmFreeContiguousMemory releases nothing and the arena fills in address
- * order. Contiguous blocks are also every texture and vertex buffer a D3D
- * title creates, and those come and go with the scene; a title that frees and
- * reallocates them as each texture pack loads runs the 64 MB window out
- * without the switch.
+ * Title-freed blocks are retained until allocation pressure, then released
+ * together and the allocation retried. This preserves existing addresses while
+ * room remains and avoids permanently leaking each match's graphics resources.
+ * RECOMP_HEAP_RECLAIM still requests immediate reuse for diagnostic purposes.
  *
  * Locked: textures are created from loader threads as well as the main one. */
 #define CONTIG_PAGE       4096u
@@ -4133,6 +4182,8 @@ void xbox_FreeThreadStack(uint32_t stack_top)
 static uint8_t  g_contig_used[CONTIG_PAGES] = { CONTIG_RESERVED };
                                                /* 1 = page belongs to a block */
 static uint32_t g_contig_len[CONTIG_PAGES];    /* pages, at a block's first page */
+static uint8_t g_contig_deferred[CONTIG_PAGES];
+static uint32_t g_contig_deferred_pages;
 static uint32_t g_contig_pages_in_use;
 static uint32_t g_contig_high = CONTIG_PAGE;   /* high-water mark, bytes */
 static uint32_t g_contig_first_free = 1;       /* no free page below this */
@@ -4192,6 +4243,38 @@ static void contig_take(uint32_t first, uint32_t n)
         g_contig_first_free++;
 }
 
+/* Give back every block the title freed and we kept (see xbox_ContiguousFree). Lock held. Returns the pages released. */
+static uint32_t contig_release_deferred(void)
+{
+    uint32_t q, released = 0, blocks = 0;
+
+    for (q = 0; q < CONTIG_PAGES; q++) {
+        uint32_t n;
+        if (!g_contig_deferred[q])
+            continue;
+        g_contig_deferred[q] = 0;
+        n = g_contig_len[q];
+        if (!n)
+            continue;
+        memset(&g_contig_used[q], 0, n);
+        g_contig_len[q] = 0;
+        g_contig_pages_in_use -= n;
+        if (q < g_contig_first_free)
+            g_contig_first_free = q;
+        g_contig_frees++;
+        released += n;
+        blocks++;
+    }
+    g_contig_deferred_pages = 0;
+    if (released) {
+        fprintf(stderr, "  [CONTIG] arena full: reused %u KB from %u blocks the title had freed; %u of %u KB in use now\n",
+                released * (CONTIG_PAGE / 1024), blocks, g_contig_pages_in_use * (CONTIG_PAGE / 1024),
+                (unsigned)(CONTIG_USABLE * (CONTIG_PAGE / 1024)));
+        fflush(stderr);
+    }
+    return released;
+}
+
 /* Whether page q may start or extend a new block.
  *
  * The first pass also keeps out of the loaded image's physical range. Here
@@ -4229,7 +4312,8 @@ static int contig_page_free(uint32_t q, int avoid_image)
 uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
                                 uint32_t phys_lo, uint32_t phys_hi)
 {
-    uint32_t n, align_pages, lo_page, limit, p, q, pass, result = 0;
+    uint32_t n, align_pages, lo_page, lo_req, limit, p, q, pass, result = 0;
+    int attempt;
 
     if (alignment < CONTIG_PAGE) alignment = CONTIG_PAGE;
     if (alignment & (alignment - 1)) {            /* round up to a power of 2 */
@@ -4245,9 +4329,22 @@ uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
     lo_page = (uint32_t)(((uint64_t)phys_lo + CONTIG_PAGE - 1) / CONTIG_PAGE);
     limit = (uint32_t)(((uint64_t)phys_hi + 1) / CONTIG_PAGE);
     if (limit > CONTIG_USABLE) limit = CONTIG_USABLE;
+    {   /* RECOMP_CONTIG_CAP_KB=n: a smaller arena, to exercise the arena-full path without playing several matches */
+        static uint32_t cap = 0xFFFFFFFFu;
+        if (cap == 0xFFFFFFFFu) {
+            const char *e = getenv("RECOMP_CONTIG_CAP_KB");
+            cap = e && atoi(e) > 0 ? (uint32_t)atoi(e) / (CONTIG_PAGE / 1024) : 0;
+        }
+        if (cap && limit > cap) limit = cap;
+    }
 
     contig_lock();
-    if (lo_page < g_contig_first_free) lo_page = g_contig_first_free;
+    lo_req = lo_page;
+    /* Second attempt only when the arena is full: blocks the title freed are given back first. */
+    for (attempt = 0; attempt < 2 && !result; attempt++) {
+    if (attempt && !(g_contig_deferred_pages && contig_release_deferred()))
+        break;
+    lo_page = lo_req < g_contig_first_free ? g_contig_first_free : lo_req;
     for (pass = contig_avoid_image() ? 0 : 1; pass < 2 && !result; pass++) {
         int avoid = pass == 0;
         p = (lo_page + align_pages - 1) & ~(align_pages - 1);
@@ -4269,6 +4366,7 @@ uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
             while (q < limit && !contig_page_free(q, avoid)) q++;
             p = (q + align_pages - 1) & ~(align_pages - 1);
         }
+    }
     }
     if (result) {
         g_contig_allocs++;
@@ -4340,11 +4438,20 @@ int xbox_ContiguousFree(uint32_t va)
     if (va < XBOX_CONTIG_BASE
             || (uint64_t)va >= (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
         return 0;
-    /* Ours, but kept: without RECOMP_HEAP_RECLAIM contiguous memory is never
-     * reused, and 1 stops the caller handing it to the general heap. */
-    if (!xbox_HeapReclaimEnabled())
-        return 1;
     first = (va - XBOX_CONTIG_BASE) / CONTIG_PAGE;
+    /* Ours, but kept: without RECOMP_HEAP_RECLAIM a freed block stays where it is, so every later allocation gets the
+     * address it always got, and 1 stops the caller handing it to the general heap. The block is only remembered as
+     * freed: xbox_ContiguousAllocEx gives those pages back when the arena would otherwise run out, rather than
+     * retaining every previous scene's graphics allocations for the process lifetime. */
+    if (!xbox_HeapReclaimEnabled()) {
+        contig_lock();
+        if (!(va & (CONTIG_PAGE - 1)) && g_contig_len[first] && !g_contig_deferred[first]) {
+            g_contig_deferred[first] = 1;
+            g_contig_deferred_pages += g_contig_len[first];
+        }
+        contig_unlock();
+        return 1;
+    }
 
     contig_lock();
     n = (va & (CONTIG_PAGE - 1)) ? 0 : g_contig_len[first];

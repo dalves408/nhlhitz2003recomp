@@ -3,7 +3,7 @@
 layout(std430,binding=0) readonly buffer Raw { uint rb[]; };
 uniform vec2 surf, gaa;
 uniform float zscale,gfpx,gfpy;
-uniform uint gfogmode;
+uniform uint gfogmode,gindexed;
 out vec4 raw_position,v_color,v_d1;
 out vec4 v_tc[4];
 out float v_fog;
@@ -56,7 +56,7 @@ float fogf(float d){
     return isnan(f)?1.0:saturate(f);
 }
 void main(){
-    uint vi=ld32(3584u+uint(gl_VertexID)*4u);
+    uint vi=gindexed!=0u?uint(gl_VertexID):ld32(3584u+uint(gl_VertexID)*4u);
 //@@BODY@@
     precise vec4 P=R[12];
     if(floatBitsToUint(P.w)==0u)P.w=1.0;
