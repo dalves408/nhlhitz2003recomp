@@ -101,6 +101,11 @@ hitz_runtime_overrides(xbox_kernel nv2a_pb_exec.c nv2a_pb_scan.c
     nv2a_vsh_interp.c nv2a_combiner.c kernel_bridge.c kernel_hal.c xbox_memory_layout.c kernel_path.c kernel_file.c)
 hitz_runtime_overrides(host_time host_time.c)
 hitz_runtime_overrides(xbox_apu apu_xaudio2.c)
+# JOJO item 15 (experimental, off by default): the Windows build's APU voice processor override.
+option(HITZ_LINUX_APU_VP "Build overrides/apu_vp.c on Linux like Windows" OFF)
+if(HITZ_LINUX_APU_VP)
+    hitz_runtime_overrides(xbox_apu apu_vp.c)
+endif()
 hitz_runtime_overrides(xbox_usb usb_gamepad.c ohci.c)
 hitz_runtime_overrides(xbox_input keyboard.c)
 target_include_directories(xbox_input PRIVATE "${XBOXRECOMP_DIR}/src/input")

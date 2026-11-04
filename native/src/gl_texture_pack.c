@@ -28,7 +28,7 @@ typedef struct {
 static struct {
     Entry *entry;unsigned count,capacity;
     int *map;unsigned mask;
-    int configured,enabled,category[5],async,log,stop;
+    int configured,enabled,live,category[5],async,log,stop;
     unsigned formats,max_size;
     uint64_t gpu_budget,cpu_budget;
     double upload_ms;
@@ -37,6 +37,7 @@ static struct {
     HitzGlPackStats stats;
     void (*invalidate)(GLuint);
 } p;
+static void release(unsigned i);
 static const char *categories[]={"rink","logos","jerseys","glow","other"};
 static uint64_t now_us(void)
 {uint64_t c=SDL_GetPerformanceCounter(),f=SDL_GetPerformanceFrequency();return c/f*1000000ull+(c%f)*1000000ull/f;}
@@ -182,7 +183,8 @@ void hitz_gl_pack_init(unsigned scale,void (*invalidate)(GLuint))
 {
     if(p.configured)return;
     p.configured=1;p.invalidate=invalidate;settings();
-    if(!p.enabled||scale<2)return;
+    /* JOJO item 26: index the pack even when off (as backend_d3d11.c), so F1 can switch it live */
+    p.live=p.enabled;(void)scale;   /* item 27: scanned at every scale; Render Scale changes live */
     p.formats=(1u<<HITZ_PACK_BGRA8)|(1u<<HITZ_PACK_RGBA8);
     if(epoxy_gl_version()>=42||epoxy_has_gl_extension("GL_ARB_texture_compression_bptc"))p.formats|=1u<<HITZ_PACK_BC7;
     if(epoxy_has_gl_extension("GL_EXT_texture_compression_s3tc"))p.formats|=(1u<<HITZ_PACK_BC1)|(1u<<HITZ_PACK_BC2)|(1u<<HITZ_PACK_BC3);
@@ -205,7 +207,15 @@ void hitz_gl_pack_init(unsigned scale,void (*invalidate)(GLuint))
     fprintf(stderr,"[GL-PACK] %u images, cache=%llu MiB, pending=%llu MiB, async=%d, BC7=%d\n",p.count,(unsigned long long)(p.gpu_budget>>20),(unsigned long long)(p.cpu_budget>>20),p.async,!!(p.formats&(1u<<HITZ_PACK_BC7)));
 }
 int hitz_gl_pack_active(unsigned scale)
-{return p.enabled&&scale>=2&&p.count&&p.map&&p.lock&&p.wake;}
+{return p.live&&scale>=2&&p.count&&p.map&&p.lock&&p.wake;}
+int hitz_gl_pack_available(unsigned scale)
+{return scale>=2&&p.count&&p.map&&p.lock&&p.wake;}
+void hitz_gl_pack_set_live(int on)
+{   /* off: free every resident replacement; queued reads finish and are dropped on upload */
+    p.live=on!=0;p.enabled=p.live;
+    if(!p.live&&p.lock)for(unsigned i=0;i<p.count;i++)release(i);
+    fprintf(stderr,"[GL-PACK] live %s\n",p.live?"on":"off");
+}
 int hitz_gl_pack_find(uint64_t hash)
 {
     if(!hash||!p.map)return -1;

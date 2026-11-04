@@ -1,6 +1,20 @@
 /* Exercise production GLSL and native 16-bit targets against the scalar
  * combiner, using constant-color triangles for independent pixel readback. */
+#define _GNU_SOURCE
+#include <sys/mman.h>
 #include "../src/backend_gl.c"
+/* the in-game overlay (gl_overlay.inc) links against these host hooks; the test has no game */
+volatile int nhl_input_block;
+void xbox_time_pause_begin(void){} void xbox_time_pause_end(void){} void xa2_set_muted(int m){(void)m;}
+void xbox_set_vblank_hz(unsigned hz){(void)hz;}
+/* With RECOMP_GL_MSAA>1 draws land in a multisampled FBO, which glReadPixels
+ * cannot read; resolve the bound target first, as texture()/flip() do. */
+static void test_resolve_bound(void){GLint cur=0;glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING,&cur);
+    for(int i=0;i<32;i++)if(targets[i].ms&&(GLint)targets[i].msfbo==cur){resolve(&targets[i]);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER,targets[i].fbo);glBindFramebuffer(GL_DRAW_FRAMEBUFFER,targets[i].msfbo);bound_framebuffer=~0u;break;}}
+static void test_read_pixels(GLint x,GLint y,GLsizei w,GLsizei h,GLenum f,GLenum t,void *p){test_resolve_bound();glReadPixels(x,y,w,h,f,t,p);}
+#undef glReadPixels
+#define glReadPixels test_read_pixels
 static const Nv2aBackend *registered;
 static Nv2aBatchExt fixture;
 static uint32_t color_format=8;
@@ -74,6 +88,31 @@ int main(void)
             registered->draw(&s,&b);uint8_t pixel[4];glReadPixels(4,4,1,1,GL_RGBA,GL_UNSIGNED_BYTE,pixel);
             if(pixel[0]!=255||pixel[1]||pixel[2]||captured!=3){fprintf(stderr,"FAIL: GPU FFP pixel/capture\n");failures++;}
             for(int i=0;i<3;i++)for(int k=0;k<4;k++)if(fabsf(output[i*29+k]-positions[i*4+k])>1e-6f){fprintf(stderr,"FAIL: FFP position %d/%d got=%g\n",i,k,output[i*29+k]);failures++;}
+            /* Native indexing must not apply the packed indirection twice. */
+            const uint32_t permutations[2][3]={{2,0,1},{1,1,1}};
+            for(unsigned pass=0;pass<2;pass++){
+                memcpy(block+GVS_OFF_IDX,permutations[pass],12);registered->draw(&s,&b);
+                if(captured!=3){fprintf(stderr,"FAIL: indexed feedback count\n");failures++;}
+                for(unsigned i=0;i<3;i++)for(unsigned k=0;k<4;k++)
+                    if(fabsf(output[i*29+k]-positions[permutations[pass][i]*4+k])>1e-6f){
+                        fprintf(stderr,"FAIL: nonsequential/repeated index %u/%u/%u\n",pass,i,k);failures++;}
+            }
+            memcpy(block+GVS_OFF_IDX,indices,12);
+            const uint32_t high_indices[3]={65535,65536,65537};
+            memcpy(block+GVS_OFF_IDX,high_indices,12);desc[0]=3648u-65535u*16u;
+            registered->draw(&s,&b);
+            for(unsigned i=0;i<3;i++)for(unsigned k=0;k<4;k++)
+                if(fabsf(output[i*29+k]-positions[i*4+k])>1e-6f){
+                    fprintf(stderr,"FAIL: high native index %u/%u\n",i,k);failures++;}
+            memcpy(block+GVS_OFF_IDX,indices,12);desc[0]=3648;
+            /* Replacing storage must retain the newest data, including odd spans. */
+            for(int pass=0;pass<4;pass++){
+                gpu.block_bytes=sizeof(block)-(pass&1);imm[3*4]=pass&1?0:1;imm[3*4+1]=pass&1?1:0;
+                registered->draw(&s,&b);glReadPixels(4,4,1,1,GL_RGBA,GL_UNSIGNED_BYTE,pixel);
+                if(captured!=3||pixel[0]!=(pass&1?0:255)||pixel[1]!=(pass&1?255:0)){
+                    fprintf(stderr,"FAIL: replaced/odd GPU input storage %d\n",pass);failures++;}
+            }
+            gpu.block_bytes=sizeof(block);imm[3*4]=1;imm[3*4+1]=0;
             /* Captured depth cancellation: division must round before the
              * viewport offset is added (fusing used to produce -0.684615). */
             memset(constants,0,16*sizeof(float));constants[0]=1;constants[5]=2;
@@ -93,6 +132,73 @@ int main(void)
             if(!nv2a_gpuvs_probe(&gpu)){fprintf(stderr,"FAIL: decoded GPU program unavailable\n");failures++;}
             else {registered->draw(&s,&b);
                 for(int i=0;i<3;i++)for(int k=0;k<4;k++)if(fabsf(output[i*29+k]-positions[i*4+k])>1e-6f){fprintf(stderr,"FAIL: programmable position\n");failures++;}}
+            if(vertex_upload_mode()>=2){
+                /* Queue four complete ring wraps without a readback per draw.
+                 * Every tile retains its own positions and color until consumed. */
+                unsigned char *large=calloc(1,262144);if(!large)return 2;
+                memcpy(large,block,sizeof(block));Nv2aSurface saved=s;
+                s.color_va=0x80070000;s.width=s.height=64;
+                registered->clear(&s,&rs,0xf3,0,0xffffff00u);
+                gpu.block=large;gpu.block_bytes=262144;gpu.verify=0;
+                float *pos=(float *)(large+3648),*c=(float *)large;
+                for(unsigned i=0;i<256;i++){
+                    float x=(i%16)*4,y=(i/16)*4;
+                    const float tri[12]={x,y,.5f,1,x+4,y,.5f,1,x,y+4,.5f,1};
+                    memcpy(pos,tri,sizeof(tri));c[80*4]=1;c[80*4+1]=i/255.f;c[80*4+2]=0;
+                    registered->draw(&s,&b);
+                }
+                unsigned char image[64*64*4];glReadPixels(0,0,64,64,GL_RGBA,GL_UNSIGNED_BYTE,image);
+                for(unsigned i=0;i<256;i++){
+                    unsigned char *px=image+(((i/16)*4+1)*64+(i%16)*4+1)*4;
+                    if(px[0]!=255||abs((int)px[1]-(int)i)>1){
+                        fprintf(stderr,"FAIL: asynchronous ring ownership tile=%u rgba=%u/%u/%u/%u\n",i,px[0],px[1],px[2],px[3]);failures++;break;}
+                }
+                if(vertex_stream.mapped&&!vertex_stream.wraps){fprintf(stderr,"FAIL: ring stress did not wrap\n");failures++;}
+                free(large);gpu.block=block;gpu.block_bytes=sizeof(block);gpu.verify=1;s=saved;
+            }
+            if(getenv("HITZ_GL_UPLOAD_BENCH")){
+                unsigned char *large=calloc(1,262144);if(!large)return 2;
+                memcpy(large,block,sizeof(block));gpu.block=large;gpu.verify=0;
+                const unsigned sizes[]={4096,65536,262144};
+                for(unsigned shape=0;shape<3;shape++){
+                    gpu.block_bytes=sizes[shape];
+                    for(unsigned i=0;i<64;i++)registered->draw(&s,&b);
+                    glFinish();
+                    for(unsigned trial=0;trial<3;trial++){
+                        struct timespec cpu0,cpu1;clock_gettime(CLOCK_THREAD_CPUTIME_ID,&cpu0);
+                        uint64_t t0=SDL_GetPerformanceCounter();
+                        for(unsigned i=0;i<1000;i++)registered->draw(&s,&b);
+                        glFinish();uint64_t t1=SDL_GetPerformanceCounter();clock_gettime(CLOCK_THREAD_CPUTIME_ID,&cpu1);
+                        double cpu_ms=(cpu1.tv_sec-cpu0.tv_sec)*1000.0+(cpu1.tv_nsec-cpu0.tv_nsec)/1e6;
+                        fprintf(stdout,"UPLOAD_BENCH mode=%s bytes=%u trial=%u draws=1000 cpu_ms=%.3f wall_ms=%.3f\n",
+                            vertex_upload_name(vertex_upload_mode()),sizes[shape],trial,cpu_ms,(t1-t0)*1000.0/SDL_GetPerformanceFrequency());
+                    }
+                }
+                if(epoxy_has_gl_extension("GL_ARB_pipeline_statistics_query")){
+                    /* Same 32x32 grid, input bytes and shader in both modes. */
+                    unsigned cells=32,nindices=cells*cells*6,voff=GVS_OFF_IDX+nindices*4;
+                    uint32_t *ib=(uint32_t *)(large+GVS_OFF_IDX),o=0;
+                    for(unsigned y=0;y<cells;y++)for(unsigned x=0;x<cells;x++){
+                        unsigned a=y*(cells+1)+x,c=a+cells+1;
+                        ib[o++]=a;ib[o++]=a+1;ib[o++]=c;ib[o++]=c;ib[o++]=a+1;ib[o++]=c+1;
+                    }
+                    float *vp=(float *)(large+voff);
+                    for(unsigned y=0;y<=cells;y++)for(unsigned x=0;x<=cells;x++){
+                        *vp++=x;*vp++=y;*vp++=.5f;*vp++=1;
+                    }
+                    ((uint32_t *)(large+GVS_OFF_ATTR))[0]=voff;
+                    gpu.block_bytes=voff+(cells+1)*(cells+1)*16;b.count=nindices;gpu.nidx=nindices;
+                    glEnable(GL_RASTERIZER_DISCARD);registered->draw(&s,&b);glFinish();
+                    GLuint query;glGenQueries(1,&query);glBeginQuery(GL_VERTEX_SHADER_INVOCATIONS_ARB,query);
+                    for(unsigned i=0;i<100;i++)registered->draw(&s,&b);
+                    glEndQuery(GL_VERTEX_SHADER_INVOCATIONS_ARB);GLuint64 invocations=0;
+                    glGetQueryObjectui64v(query,GL_QUERY_RESULT,&invocations);glDeleteQueries(1,&query);
+                    glDisable(GL_RASTERIZER_DISCARD);b.count=3;gpu.nidx=3;
+                    fprintf(stdout,"INDEX_BENCH indexed=%d draws=100 references_per_draw=%u unique_vertices=1089 gpu_vertex_invocations=%llu\n",
+                        vertex_index_mode(),nindices,(unsigned long long)invocations);
+                }
+                free(large);gpu.block=block;gpu.block_bytes=sizeof(block);
+            }
         }
     }
     fixture.gpu=NULL;b.vertices=v;color_format=8;s.color_va=0x80050000;s.bytes_per_pixel=4;
@@ -154,6 +260,45 @@ int main(void)
         glGetTexImage(GL_TEXTURE_2D,0,GL_BGRA,GL_UNSIGNED_BYTE,readback);
         if(memcmp(readback,texture_guest+t.offset,524288)){fprintf(stderr,"FAIL: evicted texture refresh\n");failures++;}
         free(readback);
+    }
+    { const char *w=getenv("RECOMP_GL_TEXTURE_WATCH");
+      if(w&&w[0]=='1'){
+        /* Soft-dirty watch: a texture verified this epoch and untouched is not
+         * re-compared, and any write -- even the same byte value, or through a
+         * second mapping of the same memory -- forces a full check again. */
+        registered->flip();
+        if(!watch_on||!watch_epoch){fprintf(stderr,"FAIL: texture watch did not start\n");failures++;}
+        Nv2aTexture t={.offset=8192,.width=32,.height=32,.pitch=128,.color=0x12};
+        memset(texture_guest+t.offset,0x3c,4096);registered->flip();   /* written before the epoch began */
+        texture(&t);uint64_t uploads=upload_count,skips=watch_skips;
+        texture(&t);
+        if(watch_skips!=skips+1||upload_count!=uploads){fprintf(stderr,"FAIL: texture watch skip\n");failures++;}
+        const size_t edits[]={0,1,2047,4095};
+        for(unsigned k=0;k<4;k++){
+            texture_guest[t.offset+edits[k]]^=0x11;skips=watch_skips;
+            texture(&t);uint8_t readback[4096];
+            glGetTexImage(GL_TEXTURE_2D,0,GL_BGRA,GL_UNSIGNED_BYTE,readback);
+            if(watch_skips!=skips||upload_count!=++uploads||memcmp(readback,texture_guest+t.offset,4096)){
+                fprintf(stderr,"FAIL: texture watch mutation byte=%zu\n",edits[k]);failures++;}
+        }
+        /* Same frame, page still dirty: keep comparing, never skip. */
+        skips=watch_skips;texture(&t);if(watch_skips!=skips||upload_count!=uploads){fprintf(stderr,"FAIL: dirty page skipped\n");failures++;}
+        /* Next epoch: clean again. */
+        registered->flip();texture(&t);skips=watch_skips;texture(&t);
+        if(watch_skips!=skips+1){fprintf(stderr,"FAIL: texture watch after flip\n");failures++;}
+        /* Shared memory aliases: write through view B, check through view A. */
+        int fd=memfd_create("watch_test",0);
+        if(fd<0||ftruncate(fd,65536)){fprintf(stderr,"FAIL: memfd\n");failures++;}
+        else {
+            unsigned char *a=mmap(NULL,65536,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0),*bv=mmap(NULL,65536,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
+            memset(a,1,65536);registered->flip();
+            if(!watch_clean(a+4096,8192)){fprintf(stderr,"FAIL: alias clean\n");failures++;}
+            bv[4096+5000]=1;   /* same value, still a write */
+            if(watch_clean(a+4096,8192)){fprintf(stderr,"FAIL: alias write missed\n");failures++;}
+            if(!watch_clean(a+32768,4096)){fprintf(stderr,"FAIL: alias untouched range\n");failures++;}
+            munmap(a,65536);munmap(bv,65536);close(fd);
+        }
+      }
     }
     registered->flip();
     registered->clear(&s,&rs,0xf3,0xff000000u,0xffffff00u);
