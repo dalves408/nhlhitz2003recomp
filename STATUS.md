@@ -1,5 +1,44 @@
 # NHL Hitz 2003 Windows / Linux Recomp — Status
 
+## Local stopping checkpoint (2026-11-03)
+
+Stopped at the user's request after memory/audio ports, CPU/GPU profiling and
+renderer experiments. Full local handoff: `C:\Recomp\NHLHitz03\recentlinux.md`.
+No commits or GitHub uploads were made. All benchmark runs have ended.
+
+The final executable builds; 14 CTests and GPU correctness tests pass, including
+streaming/indexed paths and a forced no-buffer-storage fallback. SHA-256:
+`28896224bc5185709f080fa7a365c1c8c8a95272c92a54aa2d67c3e9b9ddceaf`.
+Cooperative futex waits are enabled. GPU uploads/indexing retain original
+defaults; persistent streaming and native indexing are explicit test options.
+CPU use dropped substantially in diagnostic phases. GPU fixture improvements
+do not establish whole-game 60 FPS; WSLg is not native Linux performance.
+The final default/VAO cleanup received GPU tests, not another full gameplay run.
+
+Saved evidence: `C:\Recomp\NHLHitz03\analysis\linux-testing\2026-11-03`.
+
+## Linux memory/audio parity follow-up (2026-11-03)
+
+Ported the Windows 1.0.1 contiguous-memory pressure recovery, 16-tap windowed
+sinc voice resampling (double-precision phase), and per-voice sample-page
+ownership protection against persistent buzz. Linux guest-window mapping and
+exact texture validation are preserved. The toolkit remains unmodified.
+
+The Linux executable builds. All 13 CTests pass, including new resampling,
+sample-page collision, deferred recovery and immediate-reclaim tests. Both
+accelerated OpenGL correctness suites pass on WSLg / RTX 3070, covering vertex
+feedback, 16-bit targets, texture mutation, and synchronous/asynchronous DDS
+loading. This is functional validation; listening in-game, repeated match/menu
+transitions, and controlled performance comparisons remain pending.
+
+At the beginning of this follow-up, the previous parity executable was preserved under
+`analysis/parity-before-memory-audio/`. Performance testing was initially held
+while other processes were active, then resumed after the user made the computer available.
+No FPS improvement is claimed for this port. Next investigate the guest GPU
+flush wait and render/vertex copies using controlled, matching gameplay runs,
+then validate candidate changes against that baseline. Do not acknowledge GPU
+commands before consumption or relax native texture mutation checks.
+
 ## Linux parity work (2026-11-03)
 
 Development resumed on `codex/linux-texture-parity`. Windows texture changes

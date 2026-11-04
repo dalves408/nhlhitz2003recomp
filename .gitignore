@@ -47,3 +47,14 @@ Thumbs.db
 tools/xiso/
 tools/xiso.zip
 .codex-remote-attachments/
+
+# Local backups, dev scratch and add-on payloads (never commit)
+*.orig
+*.pre[0-9]*
+*.rej
+native/jojo-bin/
+jojo/
+jojo-patches/
+JOJO_*.md
+texture_pack/
+*.dds
