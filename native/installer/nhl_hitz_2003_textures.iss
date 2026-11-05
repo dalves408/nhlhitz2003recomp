@@ -166,6 +166,35 @@ begin
 end;
 
 #ifdef DownloadBuild
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  if CurPageID = wpReady then begin
+    if TexturePackNeedsInstall then begin
+      WizardForm.NextButton.Caption := SetupMessage(msgButtonInstall);
+      WizardForm.PageNameLabel.Caption := SetupMessage(msgWizardReady);
+      WizardForm.PageDescriptionLabel.Caption := SetupMessage(msgReadyLabel1);
+      WizardForm.ReadyLabel.Caption := SetupMessage(msgReadyLabel2a);
+    end else begin
+      WizardForm.NextButton.Caption := '&Continue';
+      WizardForm.PageNameLabel.Caption := 'Texture pack already installed';
+      WizardForm.PageDescriptionLabel.Caption := 'The current release is already present in this game folder.';
+      WizardForm.ReadyLabel.Caption := 'Click Continue to finish. No texture download or extraction is needed.';
+    end;
+  end;
+  if (CurPageID = wpFinished) and TexturePackAlreadyCurrent then begin
+    WizardForm.FinishedHeadingLabel.Caption := 'Texture pack already installed';
+    WizardForm.FinishedLabel.Caption := 'The current 4x texture pack is already installed. No download or extraction was needed.';
+  end;
+end;
+
+function UpdateReadyMemo(Space, NewLine, MemoUserInfoInfo, MemoDirInfo, MemoTypeInfo, MemoComponentsInfo,
+  MemoGroupInfo, MemoTasksInfo: String): String;
+begin
+  Result := MemoDirInfo;
+  if not TexturePackNeedsInstall then
+    Result := Result + NewLine + NewLine + 'The current 4x texture pack is already installed. No download or extraction is needed.';
+end;
+
 procedure CancelButtonClick(CurPageID: Integer; var Cancel, Confirm: Boolean);
 begin
   TextureCancelButtonClick(Cancel, Confirm);

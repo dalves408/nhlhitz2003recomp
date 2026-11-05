@@ -1,9 +1,30 @@
-# NHL Hitz 2003 — Static Recompilation for Windows
+# NHL Hitz 2003 — Static Recompilation for Windows and Linux
 
-A native Windows port of the original Xbox **NHL Hitz 2003 (USA)**. The game's x86 executable (`default.xbe`) is
-statically recompiled to C and runs on a Windows host runtime: D3D11 graphics, XAudio2 sound, XInput and keyboard.
+A native port of the original Xbox **NHL Hitz 2003 (USA)**. The game's x86 executable (`default.xbe`) is
+statically recompiled to C. Windows uses D3D11, XAudio2 and XInput. Linux uses OpenGL and SDL2.
 
-Work in progress. A prebuilt installer is on the [releases page](https://github.com/dalves408/nhlhitz2003recomp/releases).
+## Download 1.0.3
+
+Get the appropriate package from the [1.0.3 release](https://github.com/dalves408/nhlhitz2003recomp/releases/tag/v1.0.3).
+
+| How you play | Download |
+| --- | --- |
+| Windows standalone | `NHLHitz2003-Setup-1.0.3.exe` |
+| Linux standalone | `NHLHitz2003-1.0.3-Standalone.AppImage` |
+| RecompLauncher on Windows | `NHLHitz2003-1.0.3-Windows-x64.zip` |
+| RecompLauncher on Linux | `NHLHitz2003-1.0.3-Linux-x64.tar.gz` |
+
+Windows 1.0.3 fixes in-match controller rumble and the audio mix for skates,
+hits, and puck sounds. Setup skips downloading the current texture pack when
+it is already installed. Linux 1.0.3 is the first public Linux build. Make the
+AppImage executable, then open it. Setup can reuse valid game files and existing
+textures, and adds separate Play and Settings menu entries. Fresh settings
+start fullscreen at 1× scale with the original 4:3 aspect ratio and a 60 FPS
+cap. Existing settings are preserved.
+
+Both RecompLauncher packages include a manifest for direct Play, settings, and
+headless game-data import. See the [RecompLauncher integration guide](docs/RECOMPLAUNCHER.md)
+and the [1.0.3 release notes](docs/RELEASE-1.0.3.md) for requirements and details.
 
 Windows **1.0.2** adds an optional hi-res texture download in Setup, resumable
 downloads with size/speed statistics, a Textures tab in Settings, F8 texture
@@ -16,14 +37,18 @@ uses the same shared download as game Setup.
 **No game data is included.** You need your own legally owned copy of the game (Title ID `0x4D57000B`). The ISO, its
 extracted files, the XBE and the C generated from it are never committed.
 
-## Requirements
+## Windows build requirements
 
 - Windows 10/11 x64, a D3D11 GPU
 - Visual Studio 2022 (or Build Tools) with the C++ workload
 - CMake 3.20+
 - Python 3.12 with `capstone` 5.0.7 (`pip install capstone==5.0.7`)
 
-## Build
+## Build on Windows
+
+For Linux source and packaging instructions, see the
+[Linux source branch](https://github.com/dalves408/nhlhitz2003recomp/tree/codex/linux-native)
+and the [Linux packaging notes](native/installer/linux/README.md).
 
 ### 1. Clone with the toolkit submodule
 
@@ -115,3 +140,5 @@ After success, Setup asks whether to keep its cached BIN for repairs/reinstalls
 or delete it on exit. User-supplied sibling BINs are preserved.
 The [shared payload and installer notes](docs/SHARED_TEXTURE_PAYLOAD.md) include
 the published BIN URL, checksum, build commands and validation results.
+The [texture detection notes](docs/INSTALLER_FUTURE_FIXES.md) describe how
+Windows 1.0.3 Setup recognizes and keeps the current pack.

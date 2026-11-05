@@ -4,6 +4,7 @@ var
   TextureProgress: TOutputProgressWizardPage;
   TextureTransferActive, TextureTransferCancelled, TextureExtractActive: Boolean;
   TexturePackInstalled: Boolean;
+  TexturePackAlreadyCurrent: Boolean;
   TextureUsedCache, TextureCacheChoiceAsked, TextureDeleteCacheOnExit: Boolean;
   TextureLastUiTick: LongWord;
   TexturePayloadPath, TextureCacheDir, TextureCancelFile, TextureError: String;
@@ -16,6 +17,56 @@ function TextureSetupProcessId: LongWord;
   external 'GetCurrentProcessId@kernel32.dll stdcall';
 function TextureTick: LongWord;
   external 'GetTickCount@kernel32.dll stdcall';
+
+function TextureForceRepair: Boolean;
+begin
+  Result := ExpandConstant('{param:REPAIRTEXTURES|0}') = '1';
+end;
+
+function TextureInstalledPackCurrent(Dir: String): Boolean;
+var
+  Manifest, Rest, Relative: String;
+  Lines: TArrayOfString;
+  I, Space: Integer;
+  ExpectedSize, ActualSize: Int64;
+begin
+  Result := False;
+  if Dir = '' then Exit;
+  Dir := AddBackslash(Dir) + 'texture_pack\';
+  Manifest := Dir + 'manifest.txt';
+  if not FileExists(Manifest) then Exit;
+  try
+    { Pin the expected file list rather than trusting a folder or editable
+      version label. Stat every listed file to reject missing/truncated files.
+      Explicit repair restores all files from the verified archive. }
+    if CompareText(GetSHA256OfFile(Manifest), '{#TextureManifestSHA256}') <> 0 then Exit;
+    if not LoadStringsFromFile(Manifest, Lines) then Exit;
+    if GetArrayLength(Lines) <> {#TextureFileCount} then Exit;
+    for I := 0 to GetArrayLength(Lines) - 1 do begin
+      Rest := Lines[I];
+      Space := Pos(' ', Rest);
+      if Space <> 65 then Exit;
+      Delete(Rest, 1, Space);
+      Space := Pos(' ', Rest);
+      if Space <= 1 then Exit;
+      ExpectedSize := StrToInt64Def(Copy(Rest, 1, Space - 1), -1);
+      Relative := Copy(Rest, Space + 1, Length(Rest));
+      StringChangeEx(Relative, '/', '\', True);
+      if (Relative = '') or (ExpectedSize < 0) then Exit;
+      if not FileSize64(Dir + Relative, ActualSize) then Exit;
+      if ActualSize <> ExpectedSize then Exit;
+    end;
+    Result := True;
+  except
+    Result := False; { Unreadable metadata/files never suppress an install. }
+  end;
+end;
+
+function TexturePackNeedsInstall: Boolean;
+begin
+  Result := TextureForceRepair or not TextureInstalledPackCurrent(WizardDirValue);
+  if not Result then Log('The current texture pack is installed; the texture download offer is hidden.');
+end;
 
 function WantTexturePack: Boolean;
 begin
@@ -142,7 +193,16 @@ var
   FreeBytes, TotalBytes: Int64;
 begin
   Result := '';
+  TexturePackAlreadyCurrent := False;
   if not WantTexturePack then Exit;
+  if not TextureForceRepair and TextureInstalledPackCurrent(WizardDirValue) then begin
+    TexturePackAlreadyCurrent := True;
+    TexturePackInstalled := True;
+    TextureUsedCache := False;
+    TexturePayloadPath := '';
+    Log('The current texture pack is already installed; no download or extraction is needed.');
+    Exit;
+  end;
   MapArchiveExtensions('.bin', '.7z');
   TextureCacheDir := ExpandConstant('{#TextureCacheRoot}\{#TextureSHA256}');
   TextureCancelFile := ExpandConstant('{tmp}\texture-download.cancel');
@@ -257,6 +317,7 @@ end;
 procedure InstallTexturePack;
 begin
   if not WantTexturePack then Exit;
+  if TexturePackAlreadyCurrent then Exit;
   if TexturePayloadPath = '' then RaiseException('The texture pack has not been verified.');
   TextureTransferCancelled := False;
   TextureExtractActive := True;

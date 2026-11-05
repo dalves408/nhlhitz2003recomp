@@ -3,6 +3,7 @@
  *   nhl_import <source> <dest_dir>
  *   nhl_import --check <source>    (validate without writing)
  *   nhl_import --verify <folder>   (validate an existing extraction)
+ *   nhl_import --prepare <source> <dest_dir>  (RecompLauncher setup)
  *
  * <source> is an Xbox disc image (.iso: a full Redump image or a plain XISO) or a
  * folder holding the game's files (the disc's root, with default.xbe). Only the files
@@ -32,6 +33,7 @@ static int g_err;
 static int g_check_only, g_xbe_verified;
 static unsigned long long g_image_size;
 static int g_hash_only;      /* 1 while extracting only default.xbe to hash it */
+static int g_sdk;
 
 static int manifest_find(const char *rel)
 {
@@ -44,7 +46,10 @@ static int manifest_find(const char *rel)
 
 static void progress(void)
 {
-    printf("PROGRESS %llu %llu\n", g_done, (unsigned long long)MANIFEST_BYTES);
+    if(g_sdk)
+        printf("progress %.5f Importing game files\n", 0.05 + 0.9 * g_done / MANIFEST_BYTES);
+    else
+        printf("PROGRESS %llu %llu\n", g_done, (unsigned long long)MANIFEST_BYTES);
     fflush(stdout);
 }
 
@@ -296,17 +301,16 @@ static int canonical_directory(const WCHAR *input,WCHAR out[MAX_PATH])
     while(wcslen(out)>7&&out[wcslen(out)-1]==L'\\')out[wcslen(out)-1]=0;
     return 1;
 }
-int wmain(int argc,wchar_t **argv)
+static int import_game(const WCHAR *source,const WCHAR *destination)
 {
-    int check=argc==3&&(!wcscmp(argv[1],L"--check")||!wcscmp(argv[1],L"--verify"));
-    const WCHAR *source;DWORD attr;WCHAR root[MAX_PATH],xbe[MAX_PATH],full_source[MAX_PATH];
+    int check=destination==NULL;
+    DWORD attr;WCHAR root[MAX_PATH],xbe[MAX_PATH],full_source[MAX_PATH];
     unsigned long long rs=0;unsigned rsz=0;int folder,r;FILE *marker;
-    if(argc!=3){puts("usage: nhl_import <iso or folder> <destination> | --check <source> | --verify <folder>");return 2;}
-    source=argv[check?2:1];attr=GetFileAttributesW(source);
+    attr=GetFileAttributesW(source);
     if(attr==INVALID_FILE_ATTRIBUTES){puts("ERROR The source was not found.");return 2;}
     folder=(attr&FILE_ATTRIBUTE_DIRECTORY)!=0;
     if(!check){
-        DWORD n=GetFullPathNameW(argv[2],MAX_PATH,g_dest,NULL);if(!n||n>=MAX_PATH)return 6;
+        DWORD n=GetFullPathNameW(destination,MAX_PATH,g_dest,NULL);if(!n||n>=MAX_PATH)return 6;
         while(wcslen(g_dest)>3 && (g_dest[wcslen(g_dest)-1]==L'\\'||g_dest[wcslen(g_dest)-1]==L'/'))g_dest[wcslen(g_dest)-1]=0;
     }
     if(folder){
@@ -328,13 +332,101 @@ int wmain(int argc,wchar_t **argv)
         g_hash_only=0;g_check_only=1;g_found=0;memset(g_found_flag,0,sizeof g_found_flag);walk(rs,rsz,0,"",0);
         if(g_err||!files_complete()){puts("ERROR The source image is damaged or incomplete.");return 5;}
     }
-    if(check){if(g_img!=INVALID_HANDLE_VALUE)CloseHandle(g_img);printf("OK verified %u files\n",g_found);return 0;}
+    if(check){printf("OK verified %u files\n",g_found);return 0;}
     {WCHAR path[MAX_PATH];swprintf_s(path,MAX_PATH,L"%s\\.hitz-import-complete",g_dest);DeleteFileW(path);}
     g_check_only=0;g_found=0;g_done=0;memset(g_found_flag,0,sizeof g_found_flag);
-    if(folder)r=copy_folder(root);else{walk(rs,rsz,0,"",0);r=g_err;CloseHandle(g_img);}
+    if(folder)r=copy_folder(root);else{walk(rs,rsz,0,"",0);r=g_err;}
     if(r||!files_complete()){puts("ERROR Game files could not be copied completely.");return 6;}
     swprintf_s(xbe,MAX_PATH,L"%s\\.hitz-import-complete",g_dest);
     marker=_wfopen(xbe,L"wb");if(!marker)return 6;
     r=fprintf(marker,"%s\n",IMPORT_SIGNATURE);if(fclose(marker)||r<0)return 6;
     printf("OK %u files\n",g_found);return 0;
+}
+
+static int run_import(const WCHAR *source,const WCHAR *destination)
+{
+    int result;
+    g_done=0;g_found=0;g_err=0;g_hash_only=0;g_check_only=0;g_xbe_verified=0;
+    memset(g_found_flag,0,sizeof g_found_flag);
+    result=import_game(source,destination);
+    if(g_img!=INVALID_HANDLE_VALUE){CloseHandle(g_img);g_img=INVALID_HANDLE_VALUE;}
+    return result;
+}
+
+/* The staging directory contains only manifest files created by this process. */
+static void remove_stage(const WCHAR *stage)
+{
+    WCHAR path[MAX_PATH],*slash;
+    unsigned i;
+    size_t length=wcslen(stage);
+    if(swprintf_s(path,MAX_PATH,L"%s\\.hitz-import-complete",stage)>0)DeleteFileW(path);
+    wcscpy_s(g_dest,MAX_PATH,stage);
+    for(i=0;i<MANIFEST_COUNT;i++){
+        if(!dest_path(MANIFEST[i].path,path))continue;
+        DeleteFileW(path);
+        while((slash=wcsrchr(path,L'\\'))!=NULL && (size_t)(slash-path)>length){
+            *slash=0;
+            RemoveDirectoryW(path);
+        }
+    }
+    RemoveDirectoryW(stage);
+}
+
+static int sdk_prepare(const WCHAR *source,const WCHAR *destination)
+{
+    WCHAR dest[MAX_PATH],stage[MAX_PATH],backup[MAX_PATH],lock_path[MAX_PATH],probe[MAX_PATH];
+    DWORD length=GetFullPathNameW(destination,MAX_PATH,dest,NULL),attr;
+    HANDLE lock;
+    int result=6,backed_up=0;
+    if(!length||length>=MAX_PATH||dest[length-1]==L'\\'||
+       swprintf_s(lock_path,MAX_PATH,L"%s.hitz-setup-lock",dest)<0||
+       swprintf_s(stage,MAX_PATH,L"%s.hitz-stage-%lu-%llu",dest,(unsigned long)GetCurrentProcessId(),GetTickCount64())<0||
+       swprintf_s(backup,MAX_PATH,L"%s.backup",stage)<0||
+       swprintf_s(probe,MAX_PATH,L"%s\\default.xbe",dest)<0)return 6;
+    lock=CreateFileW(lock_path,GENERIC_WRITE|DELETE,0,NULL,CREATE_NEW,
+                     FILE_ATTRIBUTE_TEMPORARY|FILE_FLAG_DELETE_ON_CLOSE,NULL);
+    if(lock==INVALID_HANDLE_VALUE){puts("ERROR Could not lock the game folder for setup.");return 6;}
+    g_sdk=1;
+    puts("progress 0.02 Checking your Xbox game source");
+    fflush(stdout);
+    attr=GetFileAttributesW(dest);
+    if(attr!=INVALID_FILE_ATTRIBUTES){
+        if(!(attr&FILE_ATTRIBUTE_DIRECTORY)||(attr&FILE_ATTRIBUTE_REPARSE_POINT))goto done;
+        if(GetFileAttributesW(probe)!=INVALID_FILE_ATTRIBUTES && run_import(dest,NULL)==0){
+            result=run_import(source,NULL);
+            if(!result)puts("progress 1 Keeping the verified game files");
+            goto done;
+        }
+    }
+    if(!CreateDirectoryW(stage,NULL))goto done;
+    result=run_import(source,stage);
+    if(!result){
+        result=6;
+        if(attr!=INVALID_FILE_ATTRIBUTES){
+            if(!MoveFileW(dest,backup))goto clean;
+            backed_up=1;
+        }
+        if(MoveFileW(stage,dest)){
+            puts("progress 1 Game files are ready");
+            result=0;
+        }else if(backed_up && !MoveFileW(backup,dest)){
+            fwprintf(stderr,L"Previous game files remain at %ls\n",backup);
+        }
+    }
+clean:
+    if(result)remove_stage(stage);
+done:
+    CloseHandle(lock);
+    return result;
+}
+
+int wmain(int argc,wchar_t **argv)
+{
+    if(argc==4&&!wcscmp(argv[1],L"--prepare"))return sdk_prepare(argv[2],argv[3]);
+    if(argc==3){
+        if(!wcscmp(argv[1],L"--check")||!wcscmp(argv[1],L"--verify"))return run_import(argv[2],NULL);
+        return run_import(argv[1],argv[2]);
+    }
+    puts("usage: nhl_import <iso or folder> <destination> | --check <source> | --verify <folder> | --prepare <source> <destination>");
+    return 2;
 }

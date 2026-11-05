@@ -566,6 +566,85 @@ static uint8_t *guest_ptr(uint32_t va, uint32_t bytes)
 static unsigned long s_n_report, s_n_ctrl, s_n_out_ep0, s_n_out_other;
 
 /* Move one transfer descriptor. Returns the condition code to report. */
+#ifdef _WIN32
+/* A short Xbox pulse can end before a Windows pad's motors spin up. Keep
+ * the first successful start alive for 250 ms, including duplicate stops.
+ * The lock serializes the timer callback with subsequent reports. */
+typedef struct HitzRumblePulse {
+    PTP_TIMER timer;
+    ULONGLONG stop_after;
+    DWORD port;
+    BOOL stop_pending;
+} HitzRumblePulse;
+
+static SRWLOCK s_rumble_lock = SRWLOCK_INIT;
+static HitzRumblePulse s_rumble_pulses[XBOX_MAX_CONTROLLERS];
+
+static void rumble_arm_stop(HitzRumblePulse *pulse, ULONGLONG delay_ms)
+{
+    LARGE_INTEGER delay;
+    FILETIME due;
+    delay.QuadPart = -(LONGLONG)delay_ms * 10000;
+    due.dwLowDateTime = delay.LowPart;
+    due.dwHighDateTime = (DWORD)delay.HighPart;
+    SetThreadpoolTimer(pulse->timer, &due, 0, 0);
+}
+
+static VOID CALLBACK rumble_stop_callback(PTP_CALLBACK_INSTANCE instance,
+                                         PVOID context, PTP_TIMER timer)
+{
+    HitzRumblePulse *pulse = context;
+    (void)instance;
+    (void)timer;
+    AcquireSRWLockExclusive(&s_rumble_lock);
+    if (pulse->stop_pending) {
+        ULONGLONG now = GetTickCount64();
+        if (now < pulse->stop_after) {
+            rumble_arm_stop(pulse, pulse->stop_after - now);
+        } else {
+            XBOX_VIBRATION zero = {0};
+            xbox_InputSetState(pulse->port, &zero);
+            pulse->stop_pending = FALSE;
+            pulse->stop_after = 0;
+        }
+    }
+    ReleaseSRWLockExclusive(&s_rumble_lock);
+}
+
+static DWORD rumble_send(DWORD port, const XBOX_VIBRATION *vibration)
+{
+    HitzRumblePulse *pulse = &s_rumble_pulses[port];
+    DWORD result = ERROR_SUCCESS;
+    AcquireSRWLockExclusive(&s_rumble_lock);
+    ULONGLONG now = GetTickCount64();
+    BOOL start = vibration->wLeftMotorSpeed || vibration->wRightMotorSpeed;
+    if (!start && now < pulse->stop_after) {
+        if (!pulse->timer) {
+            pulse->port = port;
+            pulse->timer = CreateThreadpoolTimer(rumble_stop_callback, pulse, NULL);
+        }
+        if (pulse->timer) {
+            if (!pulse->stop_pending) {
+                pulse->stop_pending = TRUE;
+                rumble_arm_stop(pulse, pulse->stop_after - now);
+            }
+            ReleaseSRWLockExclusive(&s_rumble_lock);
+            return result;
+        }
+    }
+    result = xbox_InputSetState(port, vibration);
+    if (result == ERROR_SUCCESS || !start) {
+        pulse->stop_pending = FALSE;
+        pulse->stop_after = start ? now + 250 : 0;
+        if (pulse->timer) SetThreadpoolTimer(pulse->timer, NULL, 0, 0);
+    }
+    ReleaseSRWLockExclusive(&s_rumble_lock);
+    return result;
+}
+#else
+#define rumble_send xbox_InputSetState
+#endif
+
 static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
 {
     uint32_t info = rd32(td);
@@ -686,6 +765,15 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
                 const char *e = getenv("RECOMP_RUMBLE");
                 rumble = !(e && *e == '0');
             }
+            /* XAPI's SET_REPORT can live in the image even when its page is
+             * also named by the contiguous DMA window. Prefer the DMA copy
+             * when it has a valid header. */
+            if (endpoint == 0 && !(r[0] == 0 && r[1] >= 6)
+                && cbp >= g_xbox_image_lo && cbp <= g_xbox_image_hi
+                && g_xbox_image_hi - cbp >= 6 && guest_ok(cbp, 6u)) {
+                const uint8_t *image = (const uint8_t *)xbox_GetMemoryOffset() + cbp;
+                if (image[0] == 0 && image[1] >= 6) r = image;
+            }
             if (rumble && r[0] == 0x00 && r[1] >= 6) {
                 XBOX_VIBRATION v;
                 v.wLeftMotorSpeed  = (WORD)(r[2] | r[3] << 8);
@@ -693,7 +781,16 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
                 if (s_trace)
                     fprintf(stderr, "  [OHCI%d] rumble pad %d left %u right %u (ep %u)\n",
                             hc->index, pad, v.wLeftMotorSpeed, v.wRightMotorSpeed, endpoint);
-                xbox_InputSetState((DWORD)pad, &v);
+                DWORD result = rumble_send((DWORD)pad, &v);
+                static int log_rumble = -1;
+                if (log_rumble < 0) {
+                    const char *e = getenv("RECOMP_RUMBLE_LOG");
+                    log_rumble = e && *e == '1';
+                }
+                if (log_rumble)
+                    fprintf(stderr, "[RUMBLE] pad %d left %u right %u rc %lu\n",
+                            pad, v.wLeftMotorSpeed, v.wRightMotorSpeed,
+                            (unsigned long)result);
             }
         }
         if (endpoint == 0) {

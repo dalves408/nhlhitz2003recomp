@@ -14,6 +14,12 @@
 #ifndef TextureExtractedBytes
 #define TextureExtractedBytes 2946748651
 #endif
+#ifndef TextureManifestSHA256
+#define TextureManifestSHA256 "f1e964e87d76b11af967e7289b87e203cf9fa592485b02c04e8b0a6318185d1b"
+#endif
+#ifndef TextureFileCount
+#define TextureFileCount 6198
+#endif
 #ifndef TextureCacheRoot
 #define TextureCacheRoot "{localappdata}\NHLHitz2003\Downloads"
 #endif

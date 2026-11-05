@@ -94,7 +94,7 @@ Name: "{autoprograms}\{#GameShortcutName} - Collect debug files"; Filename: "{sy
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
-Name: "hires"; Description: "Install the 4x hi-res texture pack (1.85 GB download if needed)"; Flags: unchecked
+Name: "hires"; Description: "Install the 4x hi-res texture pack (1.85 GB download if needed)"; Flags: unchecked; Check: TexturePackNeedsInstall
 
 [InstallDelete]
 ; Migrate old installs on repair/update. Preserve the other new executable,
@@ -390,14 +390,15 @@ begin
     S := S + NewLine + Space + WizardDirValue + NewLine + NewLine +
          'The program files are updated. Your existing game files, saves and settings are kept.';
     if MemoTasksInfo <> '' then S := S + NewLine + NewLine + MemoTasksInfo;
-    Result := S;
   end else
   begin
     S := '';
     if MemoDirInfo <> '' then S := S + MemoDirInfo + NewLine + NewLine;
     if MemoTasksInfo <> '' then S := S + MemoTasksInfo + NewLine;
-    Result := S;
   end;
+  if not TextureForceRepair and TextureInstalledPackCurrent(WizardDirValue) then
+    S := S + NewLine + NewLine + 'The current hi-res texture pack is already installed and will be kept. No texture download is needed.';
+  Result := S;
 end;
 
 { No disc is needed when the game files are already in the chosen folder. }
@@ -464,7 +465,7 @@ begin
     WizardForm.StatusLabel.Caption := 'Copying the game files from your disc (a few minutes)...';
     WizardForm.FilenameLabel.Caption := '';
     if not Exec(ExpandConstant('{tmp}\nhl_import.exe'),
-        '"' + Trim(SrcEdit.Text) + '" "' + ExpandConstant('{app}\game_files') + '"',
+        '--prepare "' + Trim(SrcEdit.Text) + '" "' + ExpandConstant('{app}\game_files') + '"',
         '', SW_HIDE, ewWaitUntilTerminated, Code) then
       Code := 99;
     if Code <> 0 then

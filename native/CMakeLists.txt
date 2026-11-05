@@ -98,7 +98,7 @@ endfunction()
 hitz_runtime_overrides(xbox_kernel nv2a_pb_exec.c nv2a_pb_scan.c
     nv2a_vsh_interp.c nv2a_combiner.c kernel_bridge.c kernel_hal.c xbox_memory_layout.c kernel_path.c kernel_file.c)
 hitz_runtime_overrides(host_time host_time.c)
-hitz_runtime_overrides(xbox_apu apu_xaudio2.c apu_vp.c)
+hitz_runtime_overrides(xbox_apu apu_xaudio2.c apu_vp.c apu_dsp.c)
 add_executable(hitz_audio_resample_test EXCLUDE_FROM_ALL tests/audio_resample_test.c)
 add_executable(hitz_audio_pages_test EXCLUDE_FROM_ALL tests/audio_pages_test.c)
 hitz_runtime_overrides(xbox_usb usb_gamepad.c ohci.c)
@@ -141,6 +141,36 @@ if(EXISTS "${nis_generated}")
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/recomp_nis.c" "${nis_source}")
     list(REMOVE_ITEM RECOMP_GEN_SOURCES "${nis_generated}")
     list(APPEND RECOMP_GEN_SOURCES "${CMAKE_CURRENT_BINARY_DIR}/recomp_nis.c")
+endif()
+
+# Keep the live vibration setting in sync when the controller screen toggles it.
+# Apply to the build copy so preparing the Xbox translation again keeps the fix.
+set(rumble_generated "${CMAKE_CURRENT_SOURCE_DIR}/src/recomp/gen/recomp_0021.c")
+if(EXISTS "${rumble_generated}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${rumble_generated}")
+    file(READ "${rumble_generated}" rumble_source)
+    set(rumble_toggle "    MEM8(edi + esi + 0x2E8) = LO8(eax);")
+    string(FIND "${rumble_source}" "${rumble_toggle}" rumble_toggle_offset)
+    if(rumble_toggle_offset EQUAL -1)
+        message(FATAL_ERROR "Could not locate the guest vibration toggle in recomp_0021.c")
+    endif()
+    string(REPLACE "${rumble_toggle}" [=[
+    MEM8(edi + esi + 0x2E8) = LO8(eax);
+    /* Use the same controller mapping as the menu's rumble preview. */
+    {
+        uint32_t selection = MEM32(esi + 0x320);
+        uint32_t slot = (int32_t)selection < SMEM32(esi + 0x31C)
+            ? MEM32(esi + 0x324) : (uint32_t)SMEM8(esi + 0x120 + edi * 0xB);
+        uint32_t pads = MEM32(0x491420);
+        if (pads && slot < 4) {
+            uint32_t pad = MEM32(pads + slot * 4);
+            if (pad) MEM8(pad + 0xDC) = LO8(eax);
+        }
+    }]=] rumble_source "${rumble_source}")
+    file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/recomp_rumble.c"
+        CONTENT "${rumble_source}" @ONLY)
+    list(REMOVE_ITEM RECOMP_GEN_SOURCES "${rumble_generated}")
+    list(APPEND RECOMP_GEN_SOURCES "${CMAKE_CURRENT_BINARY_DIR}/recomp_rumble.c")
 endif()
 
 # Core game sources

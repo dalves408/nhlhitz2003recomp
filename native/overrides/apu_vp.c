@@ -1504,7 +1504,9 @@ static void voice_process(MCPXAPUState *d,
         float g = ea_value;
         float hr;
         if ((v < MCPX_HW_MAX_3D_VOICES) && (b < 4)) {
-            hr = (float)(1 << d->vp.hrtf_headroom);
+            /* The HRTF output also passes through its destination submix. */
+            hr = (float)(1 << d->vp.hrtf_headroom)
+               * (float)(1 << d->vp.submix_headroom[bin[b]]);
         } else {
             hr = (float)(1 << d->vp.submix_headroom[bin[b]]);
         }

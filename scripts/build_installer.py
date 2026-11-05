@@ -1,11 +1,15 @@
 """Build the standalone player, importer, settings and Inno Setup package. Game data is never bundled."""
 import argparse
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
+import zipfile
+
+from recomplauncher_manifest import manifest
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -15,11 +19,14 @@ def main():
     parser.add_argument('--version', default='1.0.2')
     parser.add_argument('--debug', action='store_true', help='package the integrated xrdbg player build')
     parser.add_argument('--test', action='store_true', help='label a non-debug release-candidate package as a test build')
+    parser.add_argument('--sdk', action='store_true', help='also package a RecompLauncher release ZIP')
     parser.add_argument('--iscc', type=Path)
     parser.add_argument('--manifest-source', type=Path, help='regenerate metadata from a known-good extraction')
     args = parser.parse_args()
     if args.test and args.debug:
         parser.error('--test packages exclude the debugger; build --debug separately')
+    if args.sdk and args.debug:
+        parser.error('--sdk requires the normal release player')
     if not re.fullmatch(r'\d+\.\d+\.\d+', args.version):
         parser.error('--version must be MAJOR.MINOR.PATCH')
     def run(command):
@@ -56,6 +63,15 @@ def main():
     digest = hashlib.sha256(output.read_bytes()).hexdigest()
     output.with_suffix('.exe.sha256').write_text(f'{digest}  {output.name}\n')
     print(f'Installer: {output}\nSHA-256: {digest}')
+    if args.sdk:
+        archive = output.parent / f'NHLHitz2003-{args.version}{suffix}-Windows-x64.zip'
+        with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED) as package:
+            for name in (game_exe, 'nhl_import.exe', 'config.exe'):
+                package.write(build / 'Release' / name, name)
+            package.writestr('recomplauncher.json', json.dumps(manifest('windows'), indent=2) + '\n')
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        archive.with_suffix('.zip.sha256').write_text(f'{digest}  {archive.name}\n')
+        print(f'RecompLauncher ZIP: {archive}\nSHA-256: {digest}')
 
 
 if __name__ == '__main__':
