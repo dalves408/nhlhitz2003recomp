@@ -544,6 +544,10 @@ static void flip(void)
             glBindFramebuffer(GL_READ_FRAMEBUFFER,r->fbo);SDL_Surface *img=SDL_CreateRGBSurfaceWithFormat(0,r->w*scale,r->h*scale,32,SDL_PIXELFORMAT_ARGB8888);
             if(img){glReadPixels(0,0,img->w,img->h,GL_BGRA,GL_UNSIGNED_BYTE,img->pixels);char path[4096];snprintf(path,sizeof(path),"%sgl_%06llu.bmp",dump,(unsigned long long)flips);SDL_SaveBMP(img,path);SDL_FreeSurface(img);captured=1;}
         }
+        /* Dev FPS HUD after guest blit, before swap. Captures stay overlay-free.
+         * Numbers refresh ~500 ms; gated by RECOMP_GL_FPS_OVERLAY (#ifndef NHL_RELEASE). */
+        if(ov_fps_overlay_enabled()&&!ov_mode)
+            ov_draw_fps_hud(w,h);
         if(present_hz>0&&!cap_sync){
             struct timespec ts;clock_gettime(CLOCK_MONOTONIC,&ts);
             uint64_t now=(uint64_t)ts.tv_sec*1000000000ull+(uint64_t)ts.tv_nsec;
@@ -585,6 +589,7 @@ static void flip(void)
         double per_frame=(flips+1-title_flips)?(double)title_draws/(flips+1-title_flips):0;
         snprintf(title,sizeof(title),"NHL Hitz 2003 - OpenGL | FPS: %.1f | CPU: %s | GPU: %s | draws/frame: %.0f",fps,cpu_text,gpu_text,per_frame);
         SDL_SetWindowTitle(window,title);
+        ov_fps_hud_set((float)fps,cpu,gpu,(int)(per_frame+.5));
         if(getenv("RECOMP_PERF_LOG"))fprintf(stderr,"[PERF] fps=%.3f process_cpu_pct=%d gpu_pct=%d logical_cpu_normalized=1 draws_per_frame=%.1f\n",fps,cpu,gpu,per_frame);
         if(getenv("RECOMP_PERF_LOG")&&watch_on>0)fprintf(stderr,"[GL] texture watch max_aliases=%u maps=%u\n",watch_max_aliases,watch_nmaps);
         title_flips=flips+1;title_draws=0;last_report=now;if(frame_csv)fflush(frame_csv);

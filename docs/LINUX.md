@@ -190,3 +190,10 @@ custom NV2A pushbuffer D3D11 renderer.
 
 The Windows stability/performance limitations in `STATUS.md` remain relevant.
 Installing dependencies does not establish Linux build or runtime support.
+
+## Performance launcher defaults (clean)
+
+See [`PERF_LINUX_OVERLAY.md`](PERF_LINUX_OVERLAY.md): `RECOMP_GL_WORKERS=2`, exact
+texture validation, coalesce off, and an optional on-screen FPS HUD
+(`RECOMP_GL_FPS_OVERLAY` / `HITZ_FPS_OVERLAY`, ~500 ms refresh, `#ifndef NHL_RELEASE`).
+Sampled validation and draw-coalesce are **not** defaults.

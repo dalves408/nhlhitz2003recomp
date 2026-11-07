@@ -326,6 +326,83 @@ static void ov_blit_frame(Target *r,int w,int h)
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER,0);bound_framebuffer=~0u;glDisable(GL_SCISSOR_TEST);glColorMask(1,1,1,1);glClearColor(0,0,0,1);glClear(GL_COLOR_BUFFER_BIT);state_valid=0;
     glBindFramebuffer(GL_READ_FRAMEBUFFER,r->fbo);glBlitFramebuffer(0,0,r->w*scale,r->h*scale,(w-vw)/2,(h+vh)/2,(w+vw)/2,(h-vh)/2,GL_COLOR_BUFFER_BIT,GL_LINEAR);
 }
+/* Dev-only on-screen FPS HUD. All fields (FPS, CPU, GPU, draws) refresh
+ * together every ~500 ms (2 Hz averaged) — not every frame.
+ * Gated by RECOMP_GL_FPS_OVERLAY=1; compiled out of NHL_RELEASE builds.
+ * Does not pause the game (unlike F1/Esc overlays). */
+#ifndef NHL_RELEASE
+static int ov_fps_hud_on=-1;
+static char ov_fps_line[160];
+static int ov_fps_line_ready;
+static uint64_t ov_fps_win_t0,ov_fps_win_flips,ov_fps_win_draws;
+static uint64_t ov_fps_refresh_ticks(void){return SDL_GetPerformanceFrequency()/2;}
+static int ov_fps_overlay_enabled(void)
+{
+    if(ov_fps_hud_on<0){
+        const char *v=getenv("RECOMP_GL_FPS_OVERLAY");
+        ov_fps_hud_on=v&&atoi(v)!=0;
+        if(ov_fps_hud_on)fprintf(stderr,"[GL] FPS overlay on (RECOMP_GL_FPS_OVERLAY)\n");
+    }
+    return ov_fps_hud_on>0;
+}
+static void ov_fps_rebuild_line(float fps,int cpu,int gpu,int draws)
+{
+    if(fps<=0.f)return;
+    if(cpu>=0&&gpu>=0)
+        snprintf(ov_fps_line,sizeof ov_fps_line,"FPS %.1f  CPU %d%%  GPU %d%%  draws %d",
+                 fps,cpu,gpu,draws);
+    else if(cpu>=0)
+        snprintf(ov_fps_line,sizeof ov_fps_line,"FPS %.1f  CPU %d%%  draws %d",fps,cpu,draws);
+    else
+        snprintf(ov_fps_line,sizeof ov_fps_line,"FPS %.1f  draws %d",fps,draws);
+    ov_fps_line_ready=1;
+}
+static void ov_fps_hud_set(float fps,int cpu,int gpu,int draws)
+{
+    (void)fps;(void)cpu;(void)gpu;(void)draws;
+}
+static void ov_draw_fps_hud(int cw,int ch)
+{
+    uint64_t now=SDL_GetPerformanceCounter();
+    uint64_t period=ov_fps_refresh_ticks();
+    if(!ov_fps_win_t0){ov_fps_win_t0=now;ov_fps_win_flips=0;ov_fps_win_draws=0;}
+    ov_fps_win_flips++;
+    ov_fps_win_draws+=draws;
+    if(now-ov_fps_win_t0>=period){
+        double secs=(double)(now-ov_fps_win_t0)/(double)SDL_GetPerformanceFrequency();
+        float avg=secs>0.0?(float)(ov_fps_win_flips/secs):0.f;
+        int dpf=ov_fps_win_flips?(int)((ov_fps_win_draws+ov_fps_win_flips/2)/ov_fps_win_flips):0;
+        int cpu=-1,gpu=-1;
+        hitz_linux_performance_sample(&cpu,&gpu);
+        if(avg>0.f)ov_fps_rebuild_line(avg,cpu,gpu,dpf);
+        ov_fps_win_t0=now;ov_fps_win_flips=0;ov_fps_win_draws=0;
+    }
+    if(!ov_fps_line_ready)return;
+    ov_gl_init();
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER,0);bound_framebuffer=~0u;
+    glViewport(0,0,cw,ch);
+    glDisable(GL_DEPTH_TEST);glDisable(GL_STENCIL_TEST);glDisable(GL_CULL_FACE);glDisable(GL_SCISSOR_TEST);
+    glColorMask(1,1,1,1);glEnable(GL_BLEND);glBlendEquation(GL_FUNC_ADD);glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
+    glUseProgram(ov_prog);glUniform2f(ov_usz,(float)cw,(float)ch);
+    glUniform1i(glGetUniformLocation(ov_prog,"tx"),0);
+    glActiveTexture(GL_TEXTURE0);glBindSampler(0,0);glBindVertexArray(ov_vao);glBindBuffer(GL_ARRAY_BUFFER,ov_vbo);
+    ov_n=0;ov_cur=1;ov_sw=(float)cw;ov_sh=(float)ch;
+    float px=ch*0.035f;if(px<18.f)px=18.f;if(px>36.f)px=36.f;
+    float pad=px*0.35f,tw=ov_text_w(1,ov_fps_line,px),th=px*1.15f;
+    float x0=pad,y0=pad,x1=x0+tw+pad*2.f,y1=y0+th+pad;
+    if(x1>cw-pad){px=ov_fit(1,ov_fps_line,px,cw-3.f*pad);tw=ov_text_w(1,ov_fps_line,px);th=px*1.15f;x1=x0+tw+pad*2.f;y1=y0+th+pad;}
+    ov_rect(x0,y0,x1,y1,0x0A0A0E,0.65f);
+    ov_text(1,ov_fps_line,px,x0+pad,x1-pad,(y0+y1)/2.f,0,0xFFE082);
+    ov_flush();
+    glDisable(GL_BLEND);glBindBuffer(GL_ARRAY_BUFFER,vbo);glBindVertexArray(vao);
+    program=0;state_valid=0;viewport_w=viewport_h=0;pack_invalidate_bindings(0);
+    for(int i=0;i<4;i++)bound_samplers[i]=~0u;
+}
+#else
+static int ov_fps_overlay_enabled(void){return 0;}
+static void ov_fps_hud_set(float fps,int cpu,int gpu,int draws){(void)fps;(void)cpu;(void)gpu;(void)draws;}
+static void ov_draw_fps_hud(int cw,int ch){(void)cw;(void)ch;}
+#endif
 static void events(void);
 /* The game is paused here while an overlay is open, as in backend_d3d11.c. */
 static void ov_pause(Target *r)
