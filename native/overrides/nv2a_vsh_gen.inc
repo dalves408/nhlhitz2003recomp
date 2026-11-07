@@ -187,3 +187,20 @@ int nv2a_vsh_gen_hlsl(const Nv2aGpuVs *e, char *out, size_t cap)
     }
     return b->ovf ? 0 : 1;
 }
+
+/* The generated arithmetic body uses a deliberately small common language.
+ * Keep the instruction decoder shared, adapting only vector spelling, loop
+ * annotations and the one scalar cast for the OpenGL host. */
+int nv2a_vsh_gen_glsl(const Nv2aGpuVs *e,char *out,size_t cap)
+{
+    char *body=malloc(cap);if(!body)return 0;
+    if(!nv2a_vsh_gen_hlsl(e,body,cap)){free(body);return 0;}
+    GenBuf b={out,0,cap,0};
+    for(const char *p=body;*p&&!b.ovf;){
+        if(!strncmp(p,"float4",6)){gen_pf(&b,"vec4");p+=6;}
+        else if(!strncmp(p,"[unroll]",8))p+=8;
+        else if(!strncmp(p,"(int)floor(a.x + 0.001)",23)){gen_pf(&b,"int(floor(a.x + 0.001))");p+=23;}
+        else {gen_pf(&b,"%c",*p++);}
+    }
+    free(body);return !b.ovf;
+}

@@ -1504,7 +1504,12 @@ static void voice_process(MCPXAPUState *d,
         float g = ea_value;
         float hr;
         if ((v < MCPX_HW_MAX_3D_VOICES) && (b < 4)) {
-            /* The HRTF output also passes through its destination submix. */
+            /* A 3D voice is scaled by the HRTF headroom and then lands in
+             * its HRTF submix bin, which carries that bin's submix headroom
+             * like any other. Hitz sets HRTF headroom 0 and submix headroom
+             * 1 on every bin, so dropping the submix term left every 3D
+             * voice (skates, hits, puck) 6 dB louder than the 2D voices
+             * (announcer, crowd) against the hardware recording. */
             hr = (float)(1 << d->vp.hrtf_headroom)
                * (float)(1 << d->vp.submix_headroom[bin[b]]);
         } else {

@@ -21,14 +21,26 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stddef.h>   /* ptrdiff_t */
+#ifdef _WIN32
 #include <windows.h>
+#define HITZ_TLS __declspec(thread)
+#else
+#include "platform/win32_compat.h"
+#include <sys/uio.h>
+#include <unistd.h>
+#define HITZ_TLS __thread
+#endif
 #include <stdlib.h>
 
 /* Guest cache flushes order coherent host memory; GPU completion is supplied
  * separately by the pushbuffer executor, never synthesized by this helper. */
 void hitz_guest_wbinvd(void)
 {
+#ifdef _WIN32
     MemoryBarrier();
+#else
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
 }
 
 /* ── ICALL trace ring buffer ───────────────────────────────── */
@@ -55,11 +67,11 @@ typedef void (*recomp_func_t)(void);
 
 /* ── Register state (defined in xbox_memory_layout.c) ──────── */
 
-extern __declspec(thread) uint32_t g_eax;
-extern __declspec(thread) uint32_t g_esp;
-extern __declspec(thread) uint32_t g_ebx;
-extern __declspec(thread) uint32_t g_ecx;
-extern __declspec(thread) uint32_t g_edx;
+extern HITZ_TLS uint32_t g_eax;
+extern HITZ_TLS uint32_t g_esp;
+extern HITZ_TLS uint32_t g_ebx;
+extern HITZ_TLS uint32_t g_ecx;
+extern HITZ_TLS uint32_t g_edx;
 extern ptrdiff_t g_xbox_mem_offset;
 
 extern recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);
@@ -87,9 +99,32 @@ static int hitz_nis_trace_enabled(void)
 static uint32_t hitz_trace_u32(uint32_t p)
 {
     uint32_t v = 0; SIZE_T got;
+#ifdef _WIN32
     ReadProcessMemory(GetCurrentProcess(), (const void *)((uintptr_t)g_xbox_mem_offset+p), &v, sizeof v, &got);
+#else
+    struct iovec local={&v,sizeof(v)}, remote={(void *)((uintptr_t)g_xbox_mem_offset+p),sizeof(v)};
+    (void)got;
+    if (process_vm_readv(getpid(),&local,1,&remote,1,0)!=(ssize_t)sizeof(v)) v=0;
+#endif
     return v;
 }
+
+#ifdef __linux__
+/* A real RET needs no further lifting. Other unresolved targets must never
+ * silently return success: stop at the missing guest code and recover it. */
+void hitz_unresolved_target(uint32_t va)
+{
+    extern uint32_t g_xbox_image_lo,g_xbox_image_hi;
+    if(va>=g_xbox_image_lo&&va<g_xbox_image_hi){
+        uint8_t opcode=(uint8_t)hitz_trace_u32(va);
+        /* Generated unresolved bodies only pop the return address. RET imm16
+         * needs a translated body so its argument cleanup cannot be lost. */
+        if(opcode==0xc3)return;
+    }
+    fprintf(stderr,"[FATAL] unresolved Xbox target %08X reached, return=%08X esp=%08X\n",va,hitz_trace_u32(g_esp),g_esp);
+    fflush(stderr);abort();
+}
+#endif
 
 static void hitz_nis_player_trace(const char *where, uint32_t player)
 {

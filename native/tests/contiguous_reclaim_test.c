@@ -12,13 +12,17 @@ int nv2a_gpuvs_probe(const void *state) { (void)state; return 0; }
 void nv2a_gpu_flush_pending(void) {}
 void xrdbg_note_exit(const char *reason) { (void)reason; }
 extern uint32_t xbox_ContiguousInUseBytes(void);
+extern uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment);
+extern uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment, uint32_t low, uint32_t high);
+extern int xbox_ContiguousFree(uint32_t va);
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"line %d: %s\n",__LINE__,#x); exit(1); } } while(0)
 
 int main(int argc, char **argv)
 {
     int immediate = argc > 1 && !strcmp(argv[1], "immediate");
-    _putenv_s("RECOMP_CONTIG_CAP_KB", "64");
-    _putenv_s("RECOMP_HEAP_RECLAIM", immediate ? "1" : "");
+    setenv("RECOMP_CONTIG_CAP_KB", "64", 1);
+    if (immediate) setenv("RECOMP_HEAP_RECLAIM", "1", 1);
+    else unsetenv("RECOMP_HEAP_RECLAIM");
     /* Exercise the actual runtime allocator without booting a guest. Its
      * default offset is zero until layout init; only map its backing window. */
     void *memory=VirtualAlloc((void *)(uintptr_t)XBOX_CONTIG_BASE,XBOX_CONTIG_SIZE,

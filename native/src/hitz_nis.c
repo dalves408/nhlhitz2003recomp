@@ -3,7 +3,11 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef _MSC_VER
 extern __declspec(thread) uint32_t g_eax, g_ecx, g_esp;
+#else
+extern __thread uint32_t g_eax, g_ecx, g_esp;
+#endif
 extern ptrdiff_t g_xbox_mem_offset;
 static int hitz_nis_trace_enabled(void)
 {

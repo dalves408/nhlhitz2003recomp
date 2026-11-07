@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=NHL Hitz 2003
+Exec=@REPO@/linux/play.sh
+Path=@REPO@/native
+Icon=nhlhitz2003
+Terminal=false
+Categories=Game;

@@ -15,6 +15,7 @@
 #if !defined(_WIN32) && !defined(_GNU_SOURCE)
 #define _GNU_SOURCE   /* glibc declares dladdr/Dl_info (RECOMP_WATCH) only under it */
 #endif
+#include <time.h>
 #include "xbox_memory_layout.h"
 #include "kernel.h"
 #include "guest_vmem.h"
@@ -26,6 +27,9 @@
 #include <setjmp.h>
 #if !defined(_WIN32)
 #include <unistd.h>   /* _exit */
+#endif
+#if defined(__linux__)
+#include "linux_guest_mapping.h"
 #endif
 
 /* XBE header field offsets (per xboxdevwiki.net/Xbe) */
@@ -278,6 +282,11 @@ static uint64_t ext_vma_span(uint64_t mirror_top)
  * the MapViewOfFileEx call it always was. */
 static void *layout_map_view(HANDLE mapping, size_t size, void *addr)
 {
+#if defined(__linux__)
+    uintptr_t a=(uintptr_t)addr,b=(uintptr_t)g_span_base;
+    if(g_span_whole_window&&a>=b&&size<=g_span_size&&a-b<=g_span_size-size)
+        return hitz_linux_map_guest(mapping,size,addr);
+#endif
 #if defined(_WIN32)
     if (win_in_window((uintptr_t)addr, size)) {
         win_split_placeholder((uintptr_t)addr, size);
@@ -296,6 +305,11 @@ static void *layout_map_view(HANDLE mapping, size_t size, void *addr)
  * documented to work. */
 static void *layout_commit_at(void *addr, size_t size)
 {
+#if defined(__linux__)
+    uintptr_t a=(uintptr_t)addr,b=(uintptr_t)g_span_base;
+    if(g_span_whole_window&&a>=b&&size<=g_span_size&&a-b<=g_span_size-size)
+        return hitz_linux_commit_guest(addr,size);
+#endif
 #if defined(_WIN32)
     if (win_in_window((uintptr_t)addr, size)) {
         win_split_placeholder((uintptr_t)addr, size);
@@ -656,8 +670,12 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-#if !defined(_WIN32) && defined(__aarch64__)
+#if !defined(_WIN32) && (defined(__aarch64__) || (defined(__linux__) && defined(__x86_64__)))
+#ifdef __aarch64__
 #include "platform/mmio_decode_a64.h"
+#else
+#include "mmio_x64_posix.h"
+#endif
 #include <sys/mman.h>
 static size_t g_ac97_hsize;    /* host page: 16 KB on arm64 Darwin */
 
@@ -705,8 +723,13 @@ int xbox_Ac97PosixFault(void *ucv, uintptr_t fault)
         __atomic_store_n(&g_ac97_posix_lock, 0, __ATOMIC_RELEASE);
         return 0;
     }
+#ifdef __aarch64__
     ok = mmio_emulate_a64((ucontext_t *)ucv, (uint32_t)(fault - (uintptr_t)g_ac97_page),
                           g_ac97_page, ac97_posix_rd, ac97_posix_wr);
+#else
+    ok = hitz_mmio_emulate((ucontext_t *)ucv, (uint32_t)(fault - (uintptr_t)g_ac97_page),
+                          g_ac97_page, ac97_posix_rd, ac97_posix_wr);
+#endif
     if (ok)
         ac97_clear_reset_bits();
     mprotect(g_ac97_page, g_ac97_hsize, PROT_READ);
@@ -724,7 +747,7 @@ static void ac97_arm_write_trap(void)
 
     if (!g_mcpx_memory || g_ac97_page)
         return;
-#if !defined(_WIN32) && !defined(__aarch64__)
+#if !defined(_WIN32) && !defined(__aarch64__) && !(defined(__linux__) && defined(__x86_64__))
     /* No POSIX decoder for this host's stores: a trapped write would be a
      * fault nothing services. Leave the page writable. */
     (void)old;
@@ -733,7 +756,7 @@ static void ac97_arm_write_trap(void)
     return;
 #endif
     g_ac97_page = (char *)g_mcpx_memory + AC97_NABM_OFFSET;
-#if !defined(_WIN32) && defined(__aarch64__)
+#if !defined(_WIN32) && (defined(__aarch64__) || (defined(__linux__) && defined(__x86_64__)))
     (void)old;
     g_ac97_hsize = (size_t)sysconf(_SC_PAGESIZE);
     if (g_ac97_hsize < AC97_TRAP_BYTES)
@@ -831,7 +854,7 @@ int xbox_VehMmioFault(void *exception_pointers)
     return 0;
 }
 #else
-#if defined(__aarch64__)
+#if defined(__aarch64__) || (defined(__linux__) && defined(__x86_64__))
 extern bool apu_hook_handle_mmio_posix(void *ucv, uintptr_t fault_addr,
                                        uint32_t fault_xbox_va, int is_write);
 #endif
@@ -843,7 +866,7 @@ extern bool apu_hook_handle_mmio_posix(void *ucv, uintptr_t fault_addr,
  * 0. */
 int xbox_PosixMmioFault(void *ucv, uintptr_t fault)
 {
-#if defined(__aarch64__)
+#if defined(__aarch64__) || (defined(__linux__) && defined(__x86_64__))
     uint32_t va;
 
     if (!mmio_fault_va(fault, &va))
@@ -1419,8 +1442,15 @@ static void nv2a_ack_busy_bits(int flip_held)
         }
         /* Interlocked: the vblank-ack thread and the guest change other
          * bits of the same word meanwhile. */
-        if (*r & mask)
+        if (*r & mask) {
             InterlockedAnd((volatile LONG *)r, (LONG)~mask);
+#if defined(__linux__)
+            if (NV2A_ACK[i].offset == NV2A_ACK_PFB_FLUSH) {
+                extern void hitz_linux_gpu_wait_notify(volatile uint32_t *reg);
+                hitz_linux_gpu_wait_notify(r);
+            }
+#endif
+        }
     }
 }
 
@@ -1445,6 +1475,32 @@ volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset)
 static volatile LONG s_ack_yield_every=-1;
 void nv2a_pbx_ack_yield_mode(int every)
 {s_ack_yield_every=every<1?1:every>64?64:every;}
+static int jojo_idle_wait_us=-1,jojo_idle_need=64;static unsigned jojo_idle_run;
+uint64_t jojo_pb_idle_ns;static int jojo_prof=-1;static uint64_t jojo_idle_t0; /* item 11 diagnostics */
+volatile unsigned long long jojo_passes,jojo_idle_passes,jojo_sleeps;
+/* JOJO item 8: RECOMP_RENDER_CPUS=<list> (e.g. "0,2" = one physical core) pins the
+ * push-buffer/render thread to those CPUs and every other thread of the process
+ * to the remaining CPUs, re-applied every 10 s to catch new threads. Off when unset. */
+#ifdef __linux__
+#include <sched.h>
+#include <dirent.h>
+#include <sys/syscall.h>
+static void jojo_render_affinity(void)
+{
+    static int on=-1;static cpu_set_t mine,rest;
+    if(on<0){const char *v=getenv("RECOMP_RENDER_CPUS");on=0;if(!v||!*v)return;
+        CPU_ZERO(&mine);for(const char *p=v;*p;){char *e;long c=strtol(p,&e,10);if(e==p)break;if(c>=0&&c<CPU_SETSIZE)CPU_SET((int)c,&mine);p=*e?e+1:e;}
+        long n=sysconf(_SC_NPROCESSORS_ONLN);CPU_ZERO(&rest);for(long c=0;c<n;c++)if(!CPU_ISSET((int)c,&mine))CPU_SET((int)c,&rest);
+        if(!CPU_COUNT(&mine)||!CPU_COUNT(&rest))return;on=1;fprintf(stderr,"[PB] render thread pinned to RECOMP_RENDER_CPUS=%s, other threads to the rest\n",v);}
+    if(!on)return;
+    pid_t self=(pid_t)syscall(SYS_gettid);sched_setaffinity(self,sizeof(mine),&mine);
+    DIR *d=opendir("/proc/self/task");if(!d)return;struct dirent *e;
+    while((e=readdir(d))){pid_t t=(pid_t)atoi(e->d_name);if(t>0&&t!=self)sched_setaffinity(t,sizeof(rest),&rest);}
+    closedir(d);
+}
+#else
+static void jojo_render_affinity(void){}
+#endif
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
@@ -1464,6 +1520,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          * flips paces only the last. */
         extern int nv2a_pb_exec_flip_poll(void);
         int flip_held = nv2a_pb_exec_flip_poll();
+        int jojo_idle = 1;  /* JOJO: no new push-buffer work this pass */
         nv2a_ack_busy_bits(flip_held);
         for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
             volatile uint32_t *r =
@@ -1515,6 +1572,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
             if (!flip_held
                     && (put != last_put || (now_ms - last_put_ms) > 2000)) {
+                jojo_idle = 0;
                 /* Survey the segment the title just submitted, once. */
                 {
                     extern void nv2a_pb_scan(uint32_t);
@@ -1656,9 +1714,32 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
         *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
                                + g_memory_offset) = GetTickCount();
 
+        /* JOJO item 4: RECOMP_PB_IDLE_WAIT_US=N (default 0 = original).
+         * After RECOMP_PB_IDLE_PASSES (default 64) consecutive passes with no
+         * new PUT, sleep N us per pass instead of Sleep(0). Work passes are
+         * never delayed; idle-pass and sleep counts go to the 600-vblank line. */
+        if(jojo_idle_wait_us<0){const char *v=getenv("RECOMP_PB_IDLE_WAIT_US");jojo_idle_wait_us=v?atoi(v):0;
+            v=getenv("RECOMP_PB_IDLE_PASSES");jojo_idle_need=v&&atoi(v)>0?atoi(v):64;
+            if(jojo_idle_wait_us>0)fprintf(stderr,"[PB] idle wait %d us after %d idle passes\n",jojo_idle_wait_us,jojo_idle_need);}
+        {static DWORD jl,ja;DWORD jn=GetTickCount();if(!jl)jl=jn;if(!ja||jn-ja>=10000){ja=jn;jojo_render_affinity();}if(getenv("RECOMP_PERF_LOG")&&jn-jl>=10000){fprintf(stderr,"[PB] passes %llu idle %llu sleeps %llu in %lu ms\n",jojo_passes,jojo_idle_passes,jojo_sleeps,(unsigned long)(jn-jl));jojo_passes=jojo_idle_passes=jojo_sleeps=0;jl=jn;}}
+        jojo_passes++; if(jojo_idle){jojo_idle_run++;jojo_idle_passes++;} else jojo_idle_run=0;
+        if(jojo_prof<0){const char *v=getenv("RECOMP_FRAME_PROFILE");jojo_prof=v&&*v;}
+        if(jojo_prof){struct timespec jt;clock_gettime(CLOCK_MONOTONIC,&jt);uint64_t jn2=(uint64_t)jt.tv_sec*1000000000ull+jt.tv_nsec;
+            if(jojo_idle&&jojo_idle_t0)jojo_pb_idle_ns+=jn2-jojo_idle_t0;jojo_idle_t0=jn2;}
+        if(jojo_idle_wait_us>0&&jojo_idle_run>=(unsigned)jojo_idle_need){
+            struct timespec ts={0,(long)jojo_idle_wait_us*1000};nanosleep(&ts,NULL);jojo_sleeps++;
+        } else
         if(s_ack_yield_every<=1 || ++yield_passes>=(unsigned)s_ack_yield_every){
             yield_passes=0;Sleep(0);
-        } else YieldProcessor();
+        } else {
+#if defined(_WIN32)
+            YieldProcessor();
+#elif defined(__x86_64__)
+            __asm__ __volatile__("pause");
+#else
+            __asm__ __volatile__("yield");
+#endif
+        }
     }
     return 0;
 }
@@ -2651,20 +2732,33 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             g_span_size = (size_t)1 << 32;
             g_span_whole_window = 1;
         }
+#if defined(__linux__)
+        /* Top-down mmap can put libraries immediately above a RAM-only span.
+         * Hold every guest aperture first, without committing physical RAM. */
+        g_span_size=(size_t)1<<32;g_span_whole_window=1;
+        g_span_base=hitz_linux_reserve_guest(g_span_size);
+#else
         g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
+#endif
         if (g_span_base) {
-            VirtualFree(g_span_base, g_memory_size, MEM_RELEASE);
-            g_memory_base = MapViewOfFileEx(g_mapping_handle,
-                                            FILE_MAP_ALL_ACCESS, 0, 0,
-                                            g_memory_size, g_span_base);
+            if(!g_span_whole_window)VirtualFree(g_span_base, g_memory_size, MEM_RELEASE);
+            g_memory_base = layout_map_view(g_mapping_handle,g_memory_size,g_span_base);
             if (!g_memory_base) {
+#if defined(__linux__)
+                hitz_linux_release_guest();
+#else
                 VirtualFree(g_span_base, g_span_size, MEM_RELEASE);
+#endif
                 g_span_base = NULL;
                 g_span_size = 0;
                 g_span_whole_window = 0;
             }
         } else {
             g_span_whole_window = 0;
+#if defined(__linux__)
+            fprintf(stderr,"xbox_MemoryLayoutInit: cannot reserve the Linux guest window\n");
+            CloseHandle(g_mapping_handle);g_mapping_handle=NULL;return FALSE;
+#endif
         }
 #endif
 
@@ -3735,7 +3829,11 @@ void xbox_MemoryLayoutShutdown(void)
     /* Whatever is left of the base+mirrors reservation. The views carved out
      * of it are already unmapped above; this releases the range itself. */
     if (g_span_base) {
+#if defined(__linux__)
+        hitz_linux_release_guest();
+#else
         VirtualFree(g_span_base, g_span_size, MEM_RELEASE);
+#endif
         g_span_base = NULL;
         g_span_size = 0;
         g_span_whole_window = 0;
