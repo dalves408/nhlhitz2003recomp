@@ -1943,7 +1943,7 @@ static void bridge_KeQuerySystemTime(void)
 {
     uint32_t time_ptr = STACK_ARG(0);
     static int trace = -1;
-    static __declspec(thread) uint32_t polls;
+    static RECOMP_TLS uint32_t polls;
     if (trace < 0) trace = getenv("RECOMP_TIME_WAIT_LOG") != NULL;
     if (trace && (++polls & 0xFFFFFFu) == 0) {
         uint32_t *sp = (uint32_t *)((uintptr_t)g_xbox_mem_offset + g_esp);
@@ -5313,8 +5313,12 @@ static void bridge_NtDeviceIoControlFile(void)
         size.QuadPart = 0;
         if (h && h != INVALID_HANDLE_VALUE)
         {
+#ifdef _WIN32
             extern BOOL hitz_disk_size(HANDLE, PLARGE_INTEGER);
             if (!hitz_disk_size(h, &size)) GetFileSizeEx(h, &size);
+#else
+            GetFileSizeEx(h, &size);
+#endif
         }
         BRIDGE_MEM32(out_va +  0) = 0;                       /* StartingOffset */
         BRIDGE_MEM32(out_va +  4) = 0;

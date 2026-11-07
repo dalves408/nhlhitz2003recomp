@@ -65,6 +65,7 @@ int nv2a_gpuvs_probe(const Nv2aGpuVs *e);
 int nv2a_vsh_export(Nv2aGpuVs *e);
 void nv2a_vsh_export_stats(uint64_t *hits,uint64_t *misses);
 int nv2a_vsh_gen_hlsl(const Nv2aGpuVs *e, char *out, size_t cap);
+int nv2a_vsh_gen_glsl(const Nv2aGpuVs *e, char *out, size_t cap);
 typedef struct {
     const Nv2aVertexExt *ext;
     const Nv2aCombiner  *rc;

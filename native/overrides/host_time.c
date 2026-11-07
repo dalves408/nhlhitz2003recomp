@@ -75,6 +75,29 @@ static LONGLONG hp_counts(LONGLONG now)
     ReleaseSRWLockShared(&s_hp_lock);
     return t;
 }
+#else
+static pthread_mutex_t s_hp_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t s_hp_cv = PTHREAD_COND_INITIALIZER;
+static uint64_t s_hp_begin, s_hp_total;
+static int s_hp_on;
+static uint64_t hp_raw_ns(void)
+{
+    struct timespec ts;clock_gettime(CLOCK_MONOTONIC,&ts);
+    return (uint64_t)ts.tv_sec*1000000000ull+(uint64_t)ts.tv_nsec;
+}
+void xbox_host_pause_begin(void)
+{
+    pthread_mutex_lock(&s_hp_lock);
+    if(!s_hp_on){s_hp_begin=hp_raw_ns();s_hp_on=1;}
+    pthread_mutex_unlock(&s_hp_lock);
+    xbox_HostTimerWake();
+}
+void xbox_host_pause_end(void)
+{
+    pthread_mutex_lock(&s_hp_lock);
+    if(s_hp_on){s_hp_total+=hp_raw_ns()-s_hp_begin;s_hp_on=0;pthread_cond_broadcast(&s_hp_cv);}
+    pthread_mutex_unlock(&s_hp_lock);
+}
 #endif
 
 uint64_t xbox_HostNowNs(void)
@@ -93,10 +116,10 @@ uint64_t xbox_HostNowNs(void)
            + (uint64_t)(t.QuadPart % freq.QuadPart) * 1000000000ull
              / (uint64_t)freq.QuadPart;
 #else
-    struct timespec ts;
-
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    pthread_mutex_lock(&s_hp_lock);
+    uint64_t now=s_hp_on?s_hp_begin:hp_raw_ns(), result=now-s_hp_total;
+    pthread_mutex_unlock(&s_hp_lock);
+    return result;
 #endif
 }
 
@@ -217,6 +240,9 @@ static void timer_wake_init(void)
 
 void xbox_HostTimerSleepNs(uint64_t ns)
 {
+    pthread_mutex_lock(&s_hp_lock);
+    while(s_hp_on)pthread_cond_wait(&s_hp_cv,&s_hp_lock);
+    pthread_mutex_unlock(&s_hp_lock);
     pthread_once(&s_timer_wake_once, timer_wake_init);
     pthread_mutex_lock(&s_timer_wake_lock);
     if (ns && !s_timer_wake_pending) {

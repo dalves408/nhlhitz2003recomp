@@ -142,3 +142,8 @@ The [shared payload and installer notes](docs/SHARED_TEXTURE_PAYLOAD.md) include
 the published BIN URL, checksum, build commands and validation results.
 The [texture detection notes](docs/INSTALLER_FUTURE_FIXES.md) describe how
 Windows 1.0.3 Setup recognizes and keeps the current pack.
+
+## Linux (optional)
+
+A native Linux OpenGL player lives alongside the Windows build. See [docs/LINUX.md](docs/LINUX.md) for dependencies, build, and `linux/play.sh`. Windows packaging and the installer flow above are unchanged.
+

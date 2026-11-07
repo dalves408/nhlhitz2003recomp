@@ -625,6 +625,10 @@ translate:
 #include <sys/types.h>
 #include <errno.h>
 #include <fcntl.h>
+#if defined(__linux__)
+#define HITZ_WRAP_FILESYSTEM
+#include "../src/filesystem_linux.h"
+#endif
 
 static char s_game_dir[MAX_PATH];
 static char s_save_dir[MAX_PATH];
@@ -688,6 +692,9 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
 
     strip_trailing_slash(s_game_dir);
     strip_trailing_slash(s_save_dir);
+#if defined(__linux__)
+    hitz_linux_set_save_root(s_save_dir);
+#endif
 
     /* The save-side directories and the partition device images, as the
      * Win32 backend makes them. Without Partition0.img a title's
