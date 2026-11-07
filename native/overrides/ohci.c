@@ -1266,7 +1266,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
                 last_poll = tnow;
                 want = 1u;
                 for (p = 1; p < 4u; p++)
-                    if (XInputGetState((DWORD)p, st) == 0)
+                    if (XInputGetState((DWORD)p, (void *)st) == 0)
                         want |= 1u << p;
                 if (test && atoi(test) > 0 && ((tnow / (DWORD)atoi(test)) & 1u))
                     want |= 2u;

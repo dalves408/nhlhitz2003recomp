@@ -1,4 +1,4 @@
-#include <windows.h>
+#include <sys/mman.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,13 +17,13 @@ static uint8_t *mcpx_apu_phys(uint64_t addr)
 #define CHECK(x) do{if(!(x)){fprintf(stderr,"line %d: %s\n",__LINE__,#x);exit(1);}}while(0)
 static void map_page(uint32_t a)
 {
-    CHECK(VirtualAlloc(g_apu_ram_ptr+a,4096,MEM_COMMIT,PAGE_READWRITE));
-    CHECK(VirtualAlloc((void *)((uintptr_t)g_apu_ram_ptr+0x80000000ull+a),4096,MEM_COMMIT,PAGE_READWRITE));
+    CHECK(mprotect(g_apu_ram_ptr+a,4096,PROT_READ|PROT_WRITE)==0);
+    CHECK(mprotect((void *)((uintptr_t)g_apu_ram_ptr+0x80000000ull+a),4096,PROT_READ|PROT_WRITE)==0);
     memset(g_apu_ram_ptr+a,0x7f,4096);
 }
 int main(void)
 {
-    g_apu_ram_ptr=VirtualAlloc(NULL,0x84000000ull,MEM_RESERVE,PAGE_NOACCESS);CHECK(g_apu_ram_ptr);
+    g_apu_ram_ptr=mmap(NULL,0x84000000ull,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);CHECK(g_apu_ram_ptr!=MAP_FAILED);
     uint32_t a=0x200000,b=a+16*4096;map_page(a);map_page(a+4096);map_page(b);
     /* Persistent silent voices must not follow a later heap-name collision. */
     for(unsigned v=64;v<=67;v++)CHECK(vp_ldl(v,a)==0);
@@ -45,6 +45,6 @@ int main(void)
     memset(s_vp_page_choice,0,sizeof s_vp_page_choice);
     CHECK(vp_ldl(65,a)==0x7f7f7f7f);
     before=lookups;CHECK(vp_phys(65,0x04000000)==mcpx_apu_phys(0x04000000));CHECK(lookups==before+2);
-    CHECK(VirtualFree(g_apu_ram_ptr,0,MEM_RELEASE));
+    CHECK(munmap(g_apu_ram_ptr,0x84000000ull)==0);
     puts("PASS: silent voice collisions, independent heap voices, restart/reset, full-page retention, boundary reads and unambiguous addresses");return 0;
 }
